@@ -1,0 +1,14 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# LLVM 生成物
+out.ll
+*.o
+Demo
+
+# 打包产物
+Demo.app/
+
+# macOS
+.DS_Store

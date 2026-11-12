@@ -1,0 +1,12 @@
+[package]
+name = "rust-learning"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+inkwell = { version = "0.9.0", features = ["llvm18-1"] }
+swc_common = "27.0.0"
+swc_core = { version = "84.0.2", features = ["ecma_parser_typescript"] }
+swc_ecma_ast = "30.0.2"
+swc_ecma_parser = { version = "47.0.0", features = ["typescript"] }
+swc_ecma_visit = "30.0.0"
