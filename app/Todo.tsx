@@ -19,7 +19,7 @@ function App() {
         c: "补齐双端截图对照",
         d: "写清两个 demo 用法",
     });
-    const done = state({ a: false, b: false, c: false, d: false });
+    const done = state({ a: false, b: false, c: false, d: false } as { [key: string]: boolean });
     const pomodoro = state(0);
     const archived = state(false);
 
@@ -63,6 +63,8 @@ function App() {
                 style={{
                     width: "100%", height: 48, padding: 12, borderRadius: 12,
                     backgroundColor: "rgb(242, 245, 250)",
+                    flexDirection: "row",
+                    alignItems: 'center',
                     fontSize: 15, color: "rgb(28, 39, 61)",
                 }}
             />
