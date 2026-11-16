@@ -4,7 +4,7 @@ set -e
 # ---------- 配置 ----------
 APP_NAME="Demo"
 BUNDLE_ID="com.example.demo"
-SIM_DEVICE="iPhone 17"
+SIM_DEVICE="iPhone 16 Pro"
 RESOURCES_DIR="resources"
 
 # ---------- 解析参数 ----------
@@ -24,8 +24,8 @@ for arg in "$@"; do
 done
 
 # ---------- 1. 生成 out.ll ----------
-echo "==> [1/5] cargo run (生成 out.ll)"
-cargo run
+echo "==> [1/5] cargo run (生成 out.ll, app=${LUMEN_APP:-dashboard})"
+cargo run -- "${LUMEN_APP:-dashboard}"
 
 # ---------- 2. 链接出可执行文件 ----------
 echo "==> [2/5] clang 链接 ${APP_NAME}"

@@ -63,7 +63,7 @@ function App() {
 }
 ```
 
-首阶段的约束：每个 App 只支持一个状态声明；状态初值为整数、字符串或布尔值。`onClick` 支持递增、递减和赋标量常量；`onInput` 支持把输入值赋给该状态；`onFocus` 支持空回调或将 `state(false)` 设为 `true`。旧的数字 `useState` 递增写法仍兼容。
+首阶段的约束：每个 App 只支持一个状态声明；状态初值为整数、字符串或布尔值。`onClick` 支持递增、递减和赋标量常量；`onInput` 支持把输入值赋给该状态；`onFocus` 支持空回调或将 `state(false)` 设为 `true`。阶段 3 起不再保留旧的 `useState` 写法，统一使用 `state(...)`。
 
 ## 响应式原型（阶段 2）
 
@@ -90,9 +90,143 @@ function App() {
 
 组件使用普通函数声明，可通过 `function Card({ title })` 解构 props 或用 `function Card(props)` 访问 props；当前支持字符串、整数和布尔值静态 props。条件表达式支持布尔条件的 `&&` 与三元表达式。条件切换会真实添加或移除 UIKit 视图，并触发布局更新；包含条件后代的 Flex 容器使用 `UIStackView`，`ScrollView` 条件内容通过 Auto Layout 更新内容尺寸。
 
-生命周期回调支持空回调或阶段 1 已支持的状态赋值操作；静态组件在界面创建时挂载，条件组件会在对应分支加入/移除时触发挂载/卸载。当前每个 App 仍只支持一个状态声明；暂不支持递归组件、动态 props 驱动的样式更新或任意生命周期回调。
+生命周期回调支持空回调或阶段 1 已支持的状态赋值操作；静态组件在界面创建时挂载，条件组件会在对应分支加入/移除时触发挂载/卸载。暂不支持递归组件、动态 props 驱动的样式更新或任意生命周期回调。
 
-## 滚动时顶部栏渐显
+## 响应式原型（阶段 3）：多状态与结构化状态
+
+状态不再限制为单个标量：一个 App 可以声明任意多个 `state(...)`，每个声明也可以是一层对象字面量。
+
+```tsx
+function App() {
+    const count = state(0);
+    const profile = state({ name: "guest", visits: 0 });
+    return <View>
+        <Text>{count}</Text>
+        <Text>{profile.name}</Text>
+        <Text>{profile.visits}</Text>
+        {profile.active ? <Text>online</Text> : <Text>offline</Text>}
+        <Button onClick={() => count++}>+1</Button>
+        <Button onClick={() => profile.visits++}>visit</Button>
+        <Button onClick={() => profile.name = "Ada"}>rename</Button>
+        <Input onInput={(value) => profile.name = value} />
+    </View>;
+}
+```
+
+对象状态会被展开成**状态单元**（cell）：标量声明就是一个单元，对象声明是每个字段各一个单元（`profile.name`、`profile.visits`）。每个单元有自己的存储全局变量和标签列表，所以 `profile.visits++` 只刷新引用 `profile.visits` 的标签和条件分支，`count`、`profile.name` 完全不受影响。
+
+- 赋值形式：`x++` / `x--`、`x = <标量字面量>`、`x = x + 1` / `x - 1`；
+- `onInput={(value) => 文本单元 = value}` 把输入框文本写入字符串单元；
+- `onFocus={() => 布尔单元 = true}` 把布尔单元置为真；
+- 单元类型不匹配（例如把输入文本写进布尔单元）会在编译期报错；
+- 仍不支持：嵌套对象、数组、跨单元的计算表达式、任意函数体。
+- 演示见 `app/App.tsx`：一个布尔状态控制条件渲染，一个对象状态（`name` + `visits`）各自独立更新。
+
+## 内置示例
+
+仓库里带两个示例，三端共用同一份 TSX，编译时用名字选（默认 `dashboard`）：
+
+| 名称 | 源码 | 演示的能力 |
+| --- | --- | --- |
+| `dashboard` | `app/App.tsx` | 条件渲染整块组件、对象状态、滚动渐显、绝对定位底栏 |
+| `todo` | `app/Todo.tsx` | 清单页：4 项逐项勾选 / 撤销、输入框改写标题、番茄计数、归档卡片 |
+
+```bash
+cargo run                              # dashboard，UIKit IR
+cargo run -- todo                      # todo，UIKit IR
+cargo run -- macos todo                # todo，AppKit IR
+cargo run -- android todo              # todo，Android IR
+LUMEN_APP=todo ./run.sh shot           # todo，打包进 iOS 模拟器并截图
+LUMEN_APP=todo ./mac.sh                # todo，macOS 版
+LUMEN_APP=todo android/build-apk.sh    # todo，打 APK（再跑 android/run-apk.sh 安装）
+```
+
+`app/tsconfig.json` 与 `app/lumen.d.ts` 覆盖两个示例，`npx -p typescript tsc -p app` 可以做类型检查。
+
+`todo` 用的是当前子集能支撑的写法：清单固定 4 项，每项有自己的布尔单元，勾选 / 撤销是两个按钮
+（一个 handler 只能写一个状态单元）；还没有数组和多语句 handler，所以“任意新增 / 删除待办”
+暂时表达不了，这也是下一步最值得补的语言能力。
+
+## 平台后端：iOS 与 macOS
+
+IR、布局和状态语义是共享的，各后端只替换视图类名、样式落点、事件和启动方式。
+
+```bash
+cargo run                # 生成 UIKit IR（默认），配 run.sh 打包进模拟器
+cargo run -- macos       # 生成 AppKit IR
+./mac.sh                 # 一步：生成 + 链接 + 运行 macOS 版
+```
+
+| | iOS（UIKit） | macOS（AppKit） |
+| --- | --- | --- |
+| 启动 | `UIApplicationMain` + AppDelegate 启动回调 | `NSApplication` + 直接建 `NSWindow`（不依赖启动回调时机） |
+| 容器 | `UIView` / `UIStackView` | `NSView` / `NSStackView` |
+| 文本 | `UILabel` | `NSTextField`（去边框、只读、默认左对齐） |
+| 按钮 | `UIButton`（titleColor / contentEdgeInsets） | `NSButton`（contentTintColor，无边框 + layer 背景） |
+| 背景 / 圆角 | `setBackgroundColor:` + layer | `wantsLayer` + layer |
+| 事件 | `addTarget:action:forControlEvents:` | `setTarget:` / `setAction:` |
+| 安全区 | `safeAreaLayoutGuide`（状态栏 / home indicator） | 同名 API，窗口内容区通常没有额外 inset |
+
+macOS 首版尚未支持：`ScrollView` 退化成普通容器（内容不滚动）、`onInput`/`onFocus` 事件、滚动渐显，以及含条件子级的容器里文本的横向对齐（`NSStackView` 对齐映射还不准）。
+
+`Input` 在 macOS 上用 `NSTextField` 渲染（占位符走 `setPlaceholderString:`），并且已经接上了
+`onInput`：构建期把输入框设为 AppDelegate 的 delegate，回调用 `controlTextDidChange:` 按身份
+找到对应输入框，再调它的 `stateActionN:`（取值用 `stringValue`）。`onFocus` 仍未接。
+
+iOS/macOS 的一个已知限制：条件分支如果直接写 `<Text>`，槽位拿不到分支的宽高，分支会渲染成一条细线。
+需要在外面包一层给定尺寸的 `View`（`app/Todo.tsx` 里的状态徽标就是这么写的）。Android 后端直接增删
+分支视图，没有这个限制。
+
+## 平台后端：Android
+
+Android 后端和 iOS / macOS 走同一条路线：编译器把同一份 IR 落成 LLVM IR，只是从 ObjC 消息调用换成
+JNI 调用，产物是 `liblumen.so`，由 `MainActivity` 在 `nativeCreate` 里交给 native 侧建控件。
+
+```bash
+cargo run -- android            # 生成 out.ll（target: aarch64-linux-android26）
+android/build-apk.sh            # 生成 IR + 链 .so + 打包签名，出 android/build/lumen.apk
+android/run-apk.sh              # 启动模拟器（未启动时）→ 安装 → 启动 → 截图
+```
+
+`build-apk.sh` 不依赖 Gradle：`out.ll` 用 NDK clang 链成 `liblumen.so`，`AndroidManifest` 与
+`android/src` 走 aapt2 / javac / d8，最后 zipalign + apksigner。`FROM_HOST_C=1` 会改为编译
+`android/jni/host.c`——那是接入完整 IR 之前手写的 JNI 参照原型。
+
+需要 **JDK 11+**（android build-tools 的 d8/apksigner 要 Java 11 以上的 class 文件），推荐 17+。
+脚本会自己从 `LUMEN_JAVA_HOME` / `/usr/libexec/java_home -v 17` / Android Studio 自带 JBR /
+Homebrew 里挑一个可用的，即使 `JAVA_HOME` 指向 JDK 8 也不影响；确实没有时直接报错提示。
+
+| | iOS（UIKit） | Android（View） |
+| --- | --- | --- |
+| 启动 | `UIApplicationMain` + AppDelegate | `Activity.onCreate` → `nativeCreate` |
+| 容器 | `UIView` / `UIStackView` | `LinearLayout`（含绝对定位子级时外层套 `FrameLayout`） |
+| 文本 | `UILabel` | `TextView`（单行 + 省略，对齐 UILabel） |
+| 按钮 | `UIButton`（titleColor / contentEdgeInsets） | `Button`（`setAllCaps(false)`，标题中间省略） |
+| 滚动 | `UIScrollView` + content 约束 | `ScrollView` + 内容 `LinearLayout` |
+| 布局 | Auto Layout 约束 | `LayoutParams`：尺寸 / `weight` / gravity / margins |
+| 事件 | target-action / delegate | Java 桥接类 → `nativeOnClick` / `onInput` / `onFocus` / `onScroll` |
+| 安全区 | `safeAreaLayoutGuide` | 状态栏 inset 由宿主壳补到内容视图上 |
+
+状态语义两端一致：每个状态单元一个全局变量 + 引用它的控件列表，写入时只刷新这一组；
+条件分支各自有一个 `FrameLayout` 槽位，切换时增删分支视图并触发挂载 / 卸载回调。
+
+为对齐 UIKit 的默认行为，Android 侧额外做了两件事，否则同样的写法会看起来不一样：
+
+- 文字类节点在行方向不拉伸到容器高度，而是按内容撑开 + `gravity` 居中。`UILabel` 不会被自己的
+  高度裁掉字形，`TextView` 会——顶部栏「44dp 高 + 22pt 字号」就是这么被切掉的；
+- 容器统一 `setClipChildren(false)` + `setClipToPadding(false)`。`UIView` 默认不裁剪子视图，
+  `ViewGroup` 默认裁到自身 padding 区域（`ScrollView` 保留裁剪，对应 `UIScrollView` 的行为）。
+
+Android 首版尚未对齐的地方（有意记录，后续再补）：
+
+- `Image` 只创建一个空 `ImageView` 占位，还没接图片资源（Android 侧要走 assets / drawable）；
+- `backgroundExtendsTo: "top"` 与 `ignoresSafeArea` 在 Android 上不生效：targetSdk 35 强制 edge-to-edge，
+  宿主壳统一把状态栏高度补成内边距，顶部栏整体落在状态栏下方；
+- `justifyContent: "space-between" / "space-around"` 用 spacer + `weight` 近似，容器主轴尺寸不确定时会退化成 start；
+- 交叉轴上的百分比尺寸退化成 `match_parent`，主轴上的百分比用 `weight` 近似；
+- `borderRadius` / `borderWidth` 走 `GradientDrawable`，因此按钮会替换掉 Material 的默认背景和涟漪效果。
+
+
 
 给顶部栏设置 `id`，并在对应的 `ScrollView` 上设置 `fadeTarget`。顶部栏整体（背景和子元素）初始透明；滚动超过 `fadeStart` 后，在 `fadeDistance` 点内渐显至完全可见。
 

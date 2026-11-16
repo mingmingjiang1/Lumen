@@ -12,3 +12,6 @@ Demo.app/
 
 # macOS
 .DS_Store
+*.png
+# macOS 产物
+Lumen-mac

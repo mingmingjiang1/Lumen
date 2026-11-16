@@ -1,3 +1,5 @@
+mod android;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,13 +11,17 @@ use swc_ecma_visit::Visit;
 
 // ---------- 你的原有部分：AST -> IRNode（保持不动） ----------
 
+/// Input 占位符的默认颜色。三端原生默认各不相同（UIKit 偏浅、Android 偏深），
+/// 这里统一成一个中性灰，样式里可以用 placeholderColor 覆盖。
+pub(crate) const DEFAULT_PLACEHOLDER_COLOR: &str = "rgb(120, 131, 155)";
+
 #[derive(Debug, Clone)]
 pub enum IRNode {
     View { style: InlineStyle, children: Vec<IRNode> },
     VStack { style: InlineStyle, children: Vec<IRNode> },
     ScrollView { style: InlineStyle, children: Vec<IRNode> },
     Conditional {
-        state_name: String,
+        cell: String,
         style: InlineStyle,
         when_true: Box<IRNode>,
         when_false: Option<Box<IRNode>>,
@@ -26,7 +32,11 @@ pub enum IRNode {
         false_unmount: Vec<usize>,
     },
     Text { content: String, style: InlineStyle },
-    StateText { initial: StateValue, style: InlineStyle },
+    StateText {
+        cell: String,
+        initial: StateValue,
+        style: InlineStyle,
+    },
     Image {
         source: String,
         mode: ImageMode,
@@ -35,9 +45,10 @@ pub enum IRNode {
     Input {
         placeholder: String,
         style: InlineStyle,
-        on_input: bool,
-        on_focus: bool,
-        focus_sets_state: bool,
+        /// 状态动作下标（SetFromInput）。
+        on_input: Option<usize>,
+        /// 状态动作下标（SetTrue 或 Noop）。
+        on_focus: Option<usize>,
         unsupported_event_handler: bool,
     },
     Button {
@@ -53,6 +64,12 @@ pub struct InlineStyle {
     width: Option<Dimension>,
     height: Option<Dimension>,
     padding: Option<f64>,
+    padding_horizontal: Option<f64>,
+    padding_vertical: Option<f64>,
+    padding_top: Option<f64>,
+    padding_right: Option<f64>,
+    padding_bottom: Option<f64>,
+    padding_left: Option<f64>,
     margin: Option<f64>,
     margin_horizontal: Option<f64>,
     margin_vertical: Option<f64>,
@@ -74,11 +91,14 @@ pub struct InlineStyle {
     text_align: Option<TextAlignment>,
     background_color: Option<String>,
     color: Option<String>,
+    /// Input 占位符颜色；不写时用 DEFAULT_PLACEHOLDER_COLOR，保证三端一致。
+    placeholder_color: Option<String>,
     border_width: Option<f64>,
     border_color: Option<String>,
     border_radius: Option<f64>,
     view_id: Option<String>,
     background_extends_to_top: bool,
+    ignores_safe_area_top: bool,
     scroll_fade_target: Option<String>,
     scroll_fade_start: Option<f64>,
     scroll_fade_distance: Option<f64>,
@@ -197,6 +217,42 @@ fn node_margins(node: &IRNode) -> Margins {
     }
 }
 
+/// 视图盒子内侧的间距。padding 先铺满四边，paddingHorizontal/Vertical 覆盖两轴，
+/// 单边 paddingTop/Right/Bottom/Left 再覆盖对应边。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Padding {
+    top: f64,
+    right: f64,
+    bottom: f64,
+    left: f64,
+}
+
+impl Padding {
+    fn horizontal(self) -> f64 {
+        self.left + self.right
+    }
+
+    fn vertical(self) -> f64 {
+        self.top + self.bottom
+    }
+
+    fn is_zero(self) -> bool {
+        self == Padding::default()
+    }
+}
+
+fn node_padding(style: &InlineStyle) -> Padding {
+    let all = style.padding.unwrap_or(0.0);
+    let horizontal = style.padding_horizontal.unwrap_or(all);
+    let vertical = style.padding_vertical.unwrap_or(all);
+    Padding {
+        top: style.padding_top.unwrap_or(vertical),
+        right: style.padding_right.unwrap_or(horizontal),
+        bottom: style.padding_bottom.unwrap_or(vertical),
+        left: style.padding_left.unwrap_or(horizontal),
+    }
+}
+
 impl Dimension {
     fn resolve(self, parent_size: f64) -> f64 {
         match self {
@@ -240,7 +296,7 @@ fn node_height(node: &IRNode, available_height: f64) -> f64 {
                         .sum::<f64>()
                         + spacing * flow_count.saturating_sub(1) as f64,
                 };
-                children_height + style.padding.unwrap_or(0.0) * 2.0
+                children_height + node_padding(style).vertical()
             }),
         IRNode::Conditional {
             when_true,
@@ -255,13 +311,13 @@ fn node_height(node: &IRNode, available_height: f64) -> f64 {
         IRNode::Text { style, .. } | IRNode::StateText { style, .. } => style
             .height
             .map(|dimension| dimension.resolve(available_height))
-            .unwrap_or_else(|| style.font_size.unwrap_or(17.0) * 1.2),
+            .unwrap_or_else(|| style.font_size.unwrap_or(17.0) * 1.2 + node_padding(style).vertical()),
         IRNode::Image { style, .. }
         | IRNode::Input { style, .. }
         | IRNode::Button { style, .. } => style
             .height
             .map(|dimension| dimension.resolve(available_height))
-            .unwrap_or(50.0),
+            .unwrap_or(50.0 + node_padding(style).vertical()),
     }
 }
 
@@ -295,7 +351,7 @@ fn node_width(node: &IRNode, available_width: f64) -> f64 {
                     })
                     .fold(0.0, f64::max),
             };
-            children_width + style.padding.unwrap_or(0.0) * 2.0
+            children_width + node_padding(style).horizontal()
         }),
         IRNode::Conditional {
             when_true,
@@ -308,15 +364,31 @@ fn node_width(node: &IRNode, available_width: f64) -> f64 {
                 .unwrap_or(0.0),
         ),
         IRNode::Text { content, style } => style.width.map(|d| d.resolve(available_width)).unwrap_or_else(|| {
-            content.chars().count() as f64 * style.font_size.unwrap_or(17.0) * 0.6
+            // 粗估文字宽度：ASCII 按 0.6 em，CJK 按 1 em（不区分会把中文标签估得太窄）
+            let em: f64 = content
+                .chars()
+                .map(|ch| if ch.is_ascii() { 0.6 } else { 1.0 })
+                .sum();
+            em * style.font_size.unwrap_or(17.0) + node_padding(style).horizontal()
         }),
-        IRNode::StateText { style, .. } => style.width.map(|d| d.resolve(available_width)).unwrap_or(50.0),
-        IRNode::Image { style, .. } => style.width.map(|d| d.resolve(available_width)).unwrap_or(100.0),
-        IRNode::Input { style, .. } => style.width.map(|d| d.resolve(available_width)).unwrap_or(240.0),
+        IRNode::StateText { style, .. } => style
+            .width
+            .map(|d| d.resolve(available_width))
+            .unwrap_or(50.0 + node_padding(style).horizontal()),
+        IRNode::Image { style, .. } => style
+            .width
+            .map(|d| d.resolve(available_width))
+            .unwrap_or(100.0 + node_padding(style).horizontal()),
+        IRNode::Input { style, .. } => style
+            .width
+            .map(|d| d.resolve(available_width))
+            .unwrap_or(240.0 + node_padding(style).horizontal()),
         IRNode::Button { title, style, .. } => style
             .width
             .map(|d| d.resolve(available_width))
-            .unwrap_or_else(|| title.chars().count() as f64 * 9.0 + 32.0),
+            .unwrap_or_else(|| {
+                title.chars().count() as f64 * 9.0 + 32.0 + node_padding(style).horizontal()
+            }),
     }
 }
 
@@ -384,7 +456,7 @@ fn node_has_input_binding(node: &IRNode) -> bool {
         | IRNode::ScrollView { children, .. } => {
             children.iter().any(node_has_input_binding)
         }
-        IRNode::Input { on_input, .. } => *on_input,
+        IRNode::Input { on_input, .. } => on_input.is_some(),
         IRNode::Conditional { when_true, when_false, .. } => {
             node_has_input_binding(when_true)
                 || when_false.as_deref().is_some_and(node_has_input_binding)
@@ -403,6 +475,43 @@ fn node_has_conditional(node: &IRNode) -> bool {
     }
 }
 
+fn has_direct_conditional(children: &[IRNode]) -> bool {
+    children
+        .iter()
+        .any(|child| matches!(child, IRNode::Conditional { .. }))
+}
+
+fn validate_ignores_safe_area_views(nodes: &[IRNode]) -> Result<(), String> {
+    for node in nodes {
+        let style = node_style(node);
+        if style.ignores_safe_area_top {
+            if style.position == Position::Absolute {
+                return Err("ignoresSafeArea: \"top\" only applies to views in flex flow".into());
+            }
+            if style.height.is_none() {
+                return Err("ignoresSafeArea: \"top\" requires an explicit height".into());
+            }
+        }
+        match node {
+            IRNode::View { children, .. }
+            | IRNode::VStack { children, .. }
+            | IRNode::ScrollView { children, .. } => validate_ignores_safe_area_views(children)?,
+            IRNode::Conditional {
+                when_true,
+                when_false,
+                ..
+            } => {
+                validate_ignores_safe_area_views(std::slice::from_ref(when_true))?;
+                if let Some(branch) = when_false.as_deref() {
+                    validate_ignores_safe_area_views(std::slice::from_ref(branch))?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn conditional_active_at_state(node: &IRNode, state: bool) -> bool {
     match node {
         IRNode::Conditional { when_false, .. } => state || when_false.is_some(),
@@ -419,6 +528,32 @@ fn conditional_arranged_index(children: &[IRNode], target: usize, state: bool) -
                 && conditional_active_at_state(child, state)
         })
         .count()
+}
+
+/// 收集带 onInput 的输入框对应的状态动作下标（macOS 的 delegate 回调要用）。
+fn collect_input_actions(nodes: &[IRNode], actions: &mut Vec<usize>) {
+    for node in nodes {
+        match node {
+            IRNode::Input {
+                on_input: Some(action),
+                ..
+            } => actions.push(*action),
+            IRNode::View { children, .. }
+            | IRNode::VStack { children, .. }
+            | IRNode::ScrollView { children, .. } => collect_input_actions(children, actions),
+            IRNode::Conditional {
+                when_true,
+                when_false,
+                ..
+            } => {
+                collect_input_actions(std::slice::from_ref(when_true), actions);
+                if let Some(node) = when_false {
+                    collect_input_actions(std::slice::from_ref(node), actions);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_initial_mount_actions(nodes: &[IRNode], actions: &mut Vec<usize>) {
@@ -451,23 +586,6 @@ fn collect_initial_mount_actions(nodes: &[IRNode], actions: &mut Vec<usize>) {
     }
 }
 
-fn node_has_focus_state_update(node: &IRNode) -> bool {
-    match node {
-        IRNode::View { children, .. }
-        | IRNode::VStack { children, .. }
-        | IRNode::ScrollView { children, .. } => {
-            children.iter().any(node_has_focus_state_update)
-        }
-        IRNode::Input {
-            focus_sets_state, ..
-        } => *focus_sets_state,
-        IRNode::Conditional { when_true, when_false, .. } => {
-            node_has_focus_state_update(when_true)
-                || when_false.as_deref().is_some_and(node_has_focus_state_update)
-        }
-        _ => false,
-    }
-}
 
 fn find_scroll_fade_config(nodes: &[IRNode]) -> Option<ScrollFadeConfig> {
     fn find_in_node(node: &IRNode) -> Option<ScrollFadeConfig> {
@@ -653,10 +771,10 @@ fn layout_flex_children(
     default_gap: f64,
 ) -> Vec<ChildLayout> {
     let direction = style.flex_direction.unwrap_or(default_direction);
-    let padding = style.padding.unwrap_or(0.0);
+    let padding = node_padding(style);
     let gap = style.spacing.unwrap_or(default_gap);
-    let inner_width = (width - 2.0 * padding).max(0.0);
-    let inner_height = (height - 2.0 * padding).max(0.0);
+    let inner_width = (width - padding.horizontal()).max(0.0);
+    let inner_height = (height - padding.vertical()).max(0.0);
     let main_size = match direction {
         FlexDirection::Row => inner_width,
         FlexDirection::Column => inner_height,
@@ -806,14 +924,14 @@ fn layout_flex_children(
         };
         layouts[index] = match direction {
             FlexDirection::Row => ChildLayout {
-                x: padding + cursor + relative_main_offset,
-                y: padding + cross_offset + relative_cross_offset,
+                x: padding.left + cursor + relative_main_offset,
+                y: padding.top + cross_offset + relative_cross_offset,
                 width: child_main_size,
                 height: child_cross_size,
             },
             FlexDirection::Column => ChildLayout {
-                x: padding + cross_offset + relative_cross_offset,
-                y: padding + cursor + relative_main_offset,
+                x: padding.left + cross_offset + relative_cross_offset,
+                y: padding.top + cursor + relative_main_offset,
                 width: child_cross_size,
                 height: child_main_size,
             },
@@ -854,17 +972,17 @@ fn layout_flex_children(
                 }
             });
         let x = left
-            .map(|value| padding + value + margin.left)
+            .map(|value| padding.left + value + margin.left)
             .or_else(|| {
-                right.map(|value| width - padding - value - margin.right - child_width)
+                right.map(|value| width - padding.right - value - margin.right - child_width)
             })
-            .unwrap_or(padding + margin.left);
+            .unwrap_or(padding.left + margin.left);
         let y = top
-            .map(|value| padding + value + margin.top)
+            .map(|value| padding.top + value + margin.top)
             .or_else(|| {
-                bottom.map(|value| height - padding - value - margin.bottom - child_height)
+                bottom.map(|value| height - padding.bottom - value - margin.bottom - child_height)
             })
-            .unwrap_or(padding + margin.top);
+            .unwrap_or(padding.top + margin.top);
         layouts[index] = ChildLayout {
             x,
             y,
@@ -875,11 +993,34 @@ fn layout_flex_children(
     layouts
 }
 
-#[derive(Debug, Clone)]
-struct StateConfig {
+/// 状态初值：标量，或一层对象字面量（对象会被展开成多个状态单元）。
+#[derive(Debug, Clone, PartialEq)]
+enum StateInit {
+    Scalar(StateValue),
+    Object(Vec<(String, StateValue)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StateDecl {
     name: String,
-    setter: String,
-    initial: StateValue,
+    initial: StateInit,
+}
+
+impl StateDecl {
+    /// 展开成可独立更新的状态单元：标量状态是它自己，对象状态是每个字段。
+    fn cells(&self) -> Vec<(String, StateValue)> {
+        match &self.initial {
+            StateInit::Scalar(value) => vec![(self.name.clone(), value.clone())],
+            StateInit::Object(fields) => fields
+                .iter()
+                .map(|(field, value)| (format!("{}.{}", self.name, field), value.clone()))
+                .collect(),
+        }
+    }
+}
+
+fn state_cells(states: &[StateDecl]) -> Vec<(String, StateValue)> {
+    states.iter().flat_map(StateDecl::cells).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -891,10 +1032,26 @@ pub enum StateValue {
 
 #[derive(Debug, Clone, PartialEq)]
 enum StateMutation {
-    Increment,
-    Decrement,
-    Set(StateValue),
     Noop,
+    Increment(String),
+    Decrement(String),
+    Set(String, StateValue),
+    SetFromInput(String),
+    SetTrue(String),
+}
+
+impl StateMutation {
+    /// 该动作写入的状态单元路径。
+    fn cell(&self) -> Option<&str> {
+        match self {
+            Self::Noop => None,
+            Self::Increment(cell)
+            | Self::Decrement(cell)
+            | Self::SetFromInput(cell)
+            | Self::SetTrue(cell) => Some(cell),
+            Self::Set(cell, _) => Some(cell),
+        }
+    }
 }
 
 impl StateValue {
@@ -910,9 +1067,8 @@ impl StateValue {
 #[derive(Debug)]
 struct UiProgram {
     nodes: Vec<IRNode>,
-    state: Option<StateConfig>,
+    states: Vec<StateDecl>,
     state_actions: Vec<StateMutation>,
-    multiple_states: bool,
     scroll_fade: Option<ScrollFadeConfig>,
     errors: Vec<String>,
 }
@@ -927,13 +1083,13 @@ struct ScrollFadeConfig {
 #[derive(Debug, Clone)]
 enum ComponentProp {
     Literal(StateValue),
-    StateReference,
+    StateReference(String),
 }
 
 #[derive(Debug, Clone)]
 enum BooleanCondition {
     State {
-        name: String,
+        cell: String,
         initial: bool,
         negated: bool,
     },
@@ -952,7 +1108,7 @@ struct ComponentDefinition<'a> {
 
 struct JsxToIrVisitor<'a> {
     ir_out: Vec<IRNode>,
-    state: Option<StateConfig>,
+    cells: Vec<(String, StateValue)>,
     state_actions: Vec<StateMutation>,
     components: HashMap<String, ComponentDefinition<'a>>,
     props: HashMap<String, ComponentProp>,
@@ -961,6 +1117,13 @@ struct JsxToIrVisitor<'a> {
 }
 
 impl JsxToIrVisitor<'_> {
+    fn cell_initial(&self, cell: &str) -> Option<&StateValue> {
+        self.cells
+            .iter()
+            .find(|(path, _)| path == cell)
+            .map(|(_, value)| value)
+    }
+
     fn add_action(&mut self, mutation: StateMutation) -> usize {
         self.state_actions.push(mutation);
         self.state_actions.len() - 1
@@ -983,7 +1146,7 @@ impl JsxToIrVisitor<'_> {
 
     fn conditional_node(
         &mut self,
-        state_name: &str,
+        cell: &str,
         initial: bool,
         when_true_expr: &Expr,
         when_false_expr: Option<&Expr>,
@@ -1011,7 +1174,7 @@ impl JsxToIrVisitor<'_> {
         };
         let style = node_style(active).clone();
         Some(IRNode::Conditional {
-            state_name: state_name.to_string(),
+            cell: cell.to_string(),
             style,
             when_true: Box::new(when_true),
             when_false: when_false.map(Box::new),
@@ -1028,11 +1191,11 @@ impl JsxToIrVisitor<'_> {
             Expr::Bin(binary) if binary.op == BinaryOp::LogicalAnd => {
                 match self.resolve_boolean_condition(binary.left.as_ref())? {
                     BooleanCondition::State {
-                        name,
+                        cell,
                         initial,
                         negated: false,
                     } => self.conditional_node(
-                        &name,
+                        &cell,
                         initial,
                         binary.right.as_ref(),
                         None,
@@ -1049,11 +1212,11 @@ impl JsxToIrVisitor<'_> {
             Expr::Cond(conditional) => {
                 match self.resolve_boolean_condition(conditional.test.as_ref())? {
                     BooleanCondition::State {
-                        name,
+                        cell,
                         initial,
                         negated,
                     } => self.conditional_node(
-                        &name,
+                        &cell,
                         initial,
                         conditional.cons.as_ref(),
                         Some(conditional.alt.as_ref()),
@@ -1072,15 +1235,19 @@ impl JsxToIrVisitor<'_> {
             Expr::Unary(unary) if unary.op == UnaryOp::Bang => (unary.arg.as_ref(), true),
             expression => (expression, false),
         };
-        if let (Some(state), Expr::Ident(identifier)) = (&self.state, expression) {
-            if identifier.sym.as_str() == state.name {
-                let StateValue::Boolean(initial) = &state.initial else {
-                    self.errors.push("conditional rendering requires state(false) or state(true)".into());
-                    return None;
+        if let Some(cell) = expr_state_path(expression) {
+            if self.cell_initial(&cell).is_some() {
+                let initial = match self.cell_initial(&cell) {
+                    Some(StateValue::Boolean(value)) => *value,
+                    _ => {
+                        self.errors
+                            .push("conditional rendering requires state(false) or state(true)".into());
+                        return None;
+                    }
                 };
                 return Some(BooleanCondition::State {
-                    name: state.name.clone(),
-                    initial: *initial,
+                    cell,
+                    initial,
                     negated,
                 });
             }
@@ -1095,18 +1262,18 @@ impl JsxToIrVisitor<'_> {
             ComponentProp::Literal(StateValue::Boolean(value)) => {
                 Some(BooleanCondition::Static(*value ^ negated))
             }
-            ComponentProp::StateReference => {
-                let Some(state) = self.state.as_ref() else {
-                    self.errors.push("state prop used in a condition requires a state declaration".into());
-                    return None;
-                };
-                let StateValue::Boolean(initial) = &state.initial else {
-                    self.errors.push("conditional rendering requires state(false) or state(true)".into());
-                    return None;
+            ComponentProp::StateReference(cell) => {
+                let initial = match self.cell_initial(cell) {
+                    Some(StateValue::Boolean(value)) => *value,
+                    _ => {
+                        self.errors
+                            .push("conditional rendering requires state(false) or state(true)".into());
+                        return None;
+                    }
                 };
                 Some(BooleanCondition::State {
-                    name: state.name.clone(),
-                    initial: *initial,
+                    cell: cell.clone(),
+                    initial,
                     negated,
                 })
             }
@@ -1132,7 +1299,7 @@ impl JsxToIrVisitor<'_> {
             if !is_declared {
                 continue;
             }
-            let Some(value) = component_prop_value(attribute, self.state.as_ref(), &self.props) else {
+            let Some(value) = component_prop_value(attribute, &self.cells, &self.props) else {
                 self.errors.push(format!(
                     "component prop '{key}' only supports string, integer, boolean, or state-reference values"
                 ));
@@ -1197,33 +1364,22 @@ impl Visit for JsxToIrVisitor<'_> {
             .or_else(|| jsx_string_attr_with_props(node, "src", &self.props))
             .unwrap_or_default();
         let placeholder = jsx_string_attr_with_props(node, "placeholder", &self.props).unwrap_or_default();
+        let cells = self.cells.clone();
         let click_handler = jsx_attr(node, "onClick").and_then(|attr| attr.value.as_ref());
-        let action = self.state.as_ref().and_then(|state| {
-            click_handler.and_then(|value| parse_state_mutation(value, state))
-        });
+        let action = click_handler.and_then(|value| parse_state_mutation(value, &cells));
         let unsupported_handler = jsx_attr(node, "onClick").is_some() && action.is_none();
-        let has_input_handler = jsx_attr(node, "onInput").is_some();
-        let input_handler = jsx_attr(node, "onInput")
-            .and_then(|attr| attr.value.as_ref());
-        let on_input = has_input_handler;
-        let input_supported = input_handler.is_some_and(|value| {
-            self.state.as_ref().is_some_and(|state| {
-                is_input_state_assignment(value, &state.name)
-            })
+        let input_handler = jsx_attr(node, "onInput").and_then(|attr| attr.value.as_ref());
+        let on_input = input_handler.and_then(|value| parse_state_mutation(value, &cells));
+        let focus_handler = jsx_attr(node, "onFocus").and_then(|attr| attr.value.as_ref());
+        let on_focus = focus_handler.and_then(|value| {
+            if is_empty_event_handler(value) {
+                Some(StateMutation::Noop)
+            } else {
+                parse_state_mutation(value, &cells)
+            }
         });
-        let has_focus_handler = jsx_attr(node, "onFocus").is_some();
-        let focus_handler = jsx_attr(node, "onFocus")
-            .and_then(|attr| attr.value.as_ref());
-        let on_focus = has_focus_handler;
-        let focus_sets_state = focus_handler.is_some_and(|value| {
-            self.state.as_ref().is_some_and(|state| {
-                matches!(&state.initial, StateValue::Boolean(false))
-                    && is_boolean_state_assignment(value, &state.name)
-            })
-        });
-        let focus_supported = focus_handler.is_some_and(|value| {
-            is_empty_event_handler(value) || focus_sets_state
-        });
+        let unsupported_input = jsx_attr(node, "onInput").is_some() && on_input.is_none();
+        let unsupported_focus = jsx_attr(node, "onFocus").is_some() && on_focus.is_none();
         let mut children = Vec::new();
         for child in &node.children {
             match child {
@@ -1251,10 +1407,12 @@ impl Visit for JsxToIrVisitor<'_> {
                                     content: value.display_value(),
                                     style: InlineStyle::default(),
                                 }),
-                                ComponentProp::StateReference => {
-                                    if let Some(state) = &self.state {
+                                ComponentProp::StateReference(cell) => {
+                                    let cell = cell.clone();
+                                    if let Some(initial) = self.cell_initial(&cell).cloned() {
                                         children.push(IRNode::StateText {
-                                            initial: state.initial.clone(),
+                                            cell,
+                                            initial,
                                             style: InlineStyle::default(),
                                         });
                                     }
@@ -1264,10 +1422,11 @@ impl Visit for JsxToIrVisitor<'_> {
                         }
                     }
                     if let JSXExpr::Expr(expr) = &container.expr {
-                        if let (Some(state), Expr::Ident(ident)) = (&self.state, expr.as_ref()) {
-                            if ident.sym.as_str() == state.name {
+                        if let Some(cell) = expr_state_path(expr.as_ref()) {
+                            if let Some(initial) = self.cell_initial(&cell).cloned() {
                                 children.push(IRNode::StateText {
-                                    initial: state.initial.clone(),
+                                    cell,
+                                    initial,
                                     style: InlineStyle::default(),
                                 });
                                 continue;
@@ -1293,11 +1452,11 @@ impl Visit for JsxToIrVisitor<'_> {
             "VStack" => self.ir_out.push(IRNode::VStack { style, children }),
             "ScrollView" => self.ir_out.push(IRNode::ScrollView { style, children }),
             "Text" => {
-                if let Some(initial) = children.iter().find_map(|child| match child {
-                    IRNode::StateText { initial, .. } => Some(initial.clone()),
+                if let Some((cell, initial)) = children.iter().find_map(|child| match child {
+                    IRNode::StateText { cell, initial, .. } => Some((cell.clone(), initial.clone())),
                     _ => None,
                 }) {
-                    self.ir_out.push(IRNode::StateText { initial, style });
+                    self.ir_out.push(IRNode::StateText { cell, initial, style });
                     return;
                 }
                 let txt = children
@@ -1339,17 +1498,17 @@ impl Visit for JsxToIrVisitor<'_> {
                 ),
                 style,
             }),
-            "Input" => self
-                .ir_out
-                .push(IRNode::Input {
+            "Input" => {
+                let input_action = on_input.map(|mutation| self.add_action(mutation));
+                let focus_action = on_focus.map(|mutation| self.add_action(mutation));
+                self.ir_out.push(IRNode::Input {
                     placeholder,
                     style,
-                    on_input,
-                    on_focus,
-                    focus_sets_state,
-                    unsupported_event_handler: (has_input_handler && !input_supported)
-                        || (has_focus_handler && !focus_supported),
-                }),
+                    on_input: input_action,
+                    on_focus: focus_action,
+                    unsupported_event_handler: unsupported_input || unsupported_focus,
+                })
+            }
             _ => self.errors.push(format!("unsupported JSX element: {tag_name}")),
         }
     }
@@ -1370,11 +1529,12 @@ fn parse_tsx_to_ast(src: &str) -> UiProgram {
     let mut parser = Parser::new_from(lexer);
     let module = parser.parse_module().expect("parse tsx failed");
 
-    let state = parse_state_config(src);
-    let components = collect_component_definitions(&module, state.as_ref());
+    let states = collect_state_decls(&module);
+    let cells = state_cells(&states);
+    let components = collect_component_definitions(&module, &cells);
     let mut visitor = JsxToIrVisitor {
         ir_out: vec![],
-        state: state.clone(),
+        cells,
         state_actions: Vec::new(),
         components,
         props: HashMap::new(),
@@ -1389,9 +1549,8 @@ fn parse_tsx_to_ast(src: &str) -> UiProgram {
     UiProgram {
         scroll_fade: find_scroll_fade_config(&visitor.ir_out),
         nodes: visitor.ir_out,
-        state,
+        states,
         state_actions: visitor.state_actions,
-        multiple_states: src.matches("state(").count() > 1,
         errors: visitor.errors,
     }
 }
@@ -1423,7 +1582,7 @@ fn find_app_root<'a>(module: &'a swc_ecma_ast::Module) -> Option<&'a JSXElement>
 
 fn collect_component_definitions<'a>(
     module: &'a swc_ecma_ast::Module,
-    state: Option<&StateConfig>,
+    cells: &[(String, StateValue)],
 ) -> HashMap<String, ComponentDefinition<'a>> {
     module.body.iter().filter_map(|item| {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Fn(function))) = item else { return None };
@@ -1473,7 +1632,7 @@ fn collect_component_definitions<'a>(
                 continue;
             }
             let Expr::Arrow(arrow) = call.args[0].expr.as_ref() else { continue };
-            *target = parse_lifecycle_mutation(arrow, state);
+            *target = parse_lifecycle_mutation(arrow, cells);
             unsupported_lifecycle |= target.is_none();
         }
         Some((name, ComponentDefinition {
@@ -1513,7 +1672,7 @@ fn component_prop_for_expr<'a>(
 
 fn component_prop_value(
     attribute: &JSXAttr,
-    state: Option<&StateConfig>,
+    cells: &[(String, StateValue)],
     props: &HashMap<String, ComponentProp>,
 ) -> Option<ComponentProp> {
     let Some(value) = &attribute.value else {
@@ -1531,10 +1690,11 @@ fn component_prop_value(
             if let Some(value) = state_value_from_expr(expression) {
                 return Some(ComponentProp::Literal(value));
             }
-            let Expr::Ident(identifier) = expression.as_ref() else { return None };
-            state
-                .is_some_and(|state| identifier.sym.as_str() == state.name)
-                .then_some(ComponentProp::StateReference)
+            let cell = expr_state_path(expression.as_ref())?;
+            cells
+                .iter()
+                .any(|(path, _)| *path == cell)
+                .then_some(ComponentProp::StateReference(cell))
         }
         _ => None,
     }
@@ -1546,9 +1706,9 @@ fn jsx_string_attr_with_props(
     props: &HashMap<String, ComponentProp>,
 ) -> Option<String> {
     let attribute = jsx_attr(node, name)?;
-    match component_prop_value(attribute, None, props)? {
+    match component_prop_value(attribute, &[], props)? {
         ComponentProp::Literal(value) => Some(value.display_value()),
-        ComponentProp::StateReference => None,
+        ComponentProp::StateReference(_) => None,
     }
 }
 
@@ -1601,6 +1761,18 @@ fn jsx_style(node: &JSXElement, props: &HashMap<String, ComponentProp>) -> Inlin
             "width" => style.width = jsx_dimension_expr_with_props(&property.value, props),
             "height" => style.height = jsx_dimension_expr_with_props(&property.value, props),
             "padding" => style.padding = jsx_number_expr_with_props(&property.value, props),
+            "paddingHorizontal" => {
+                style.padding_horizontal = jsx_number_expr_with_props(&property.value, props)
+            }
+            "paddingVertical" => {
+                style.padding_vertical = jsx_number_expr_with_props(&property.value, props)
+            }
+            "paddingTop" => style.padding_top = jsx_number_expr_with_props(&property.value, props),
+            "paddingRight" => style.padding_right = jsx_number_expr_with_props(&property.value, props),
+            "paddingBottom" => {
+                style.padding_bottom = jsx_number_expr_with_props(&property.value, props)
+            }
+            "paddingLeft" => style.padding_left = jsx_number_expr_with_props(&property.value, props),
             "margin" => style.margin = jsx_number_expr_with_props(&property.value, props),
             "marginHorizontal" => style.margin_horizontal = jsx_number_expr_with_props(&property.value, props),
             "marginVertical" => style.margin_vertical = jsx_number_expr_with_props(&property.value, props),
@@ -1651,6 +1823,9 @@ fn jsx_style(node: &JSXElement, props: &HashMap<String, ComponentProp>) -> Inlin
             }
             "flexGrow" => style.flex_grow = jsx_number_expr_with_props(&property.value, props).unwrap_or(0.0),
             "fontSize" => style.font_size = jsx_number_expr_with_props(&property.value, props),
+            "placeholderColor" => {
+                style.placeholder_color = jsx_string_expr_with_props(&property.value, props)
+            }
             "textAlign" => {
                 style.text_align = jsx_string_expr_with_props(&property.value, props).and_then(|value| match value.as_str() {
                     "left" => Some(TextAlignment::Left),
@@ -1667,6 +1842,10 @@ fn jsx_style(node: &JSXElement, props: &HashMap<String, ComponentProp>) -> Inlin
             "id" => style.view_id = jsx_string_expr_with_props(&property.value, props),
             "backgroundExtendsTo" => {
                 style.background_extends_to_top =
+                    jsx_string_expr_with_props(&property.value, props).as_deref() == Some("top")
+            }
+            "ignoresSafeArea" => {
+                style.ignores_safe_area_top =
                     jsx_string_expr_with_props(&property.value, props).as_deref() == Some("top")
             }
             "fadeTarget" => style.scroll_fade_target = jsx_string_expr_with_props(&property.value, props),
@@ -1710,6 +1889,12 @@ fn assign_style_shorthand(
             }
         }
         "padding" => style.padding = number,
+        "paddingHorizontal" => style.padding_horizontal = number,
+        "paddingVertical" => style.padding_vertical = number,
+        "paddingTop" => style.padding_top = number,
+        "paddingRight" => style.padding_right = number,
+        "paddingBottom" => style.padding_bottom = number,
+        "paddingLeft" => style.padding_left = number,
         "margin" => style.margin = number,
         "marginHorizontal" => style.margin_horizontal = number,
         "marginVertical" => style.margin_vertical = number,
@@ -1770,6 +1955,7 @@ fn assign_style_shorthand(
         "borderColor" => style.border_color = string.map(str::to_string),
         "id" => style.view_id = string.map(str::to_string),
         "backgroundExtendsTo" => style.background_extends_to_top = string == Some("top"),
+        "ignoresSafeArea" => style.ignores_safe_area_top = string == Some("top"),
         "fadeTarget" => style.scroll_fade_target = string.map(str::to_string),
         _ => {}
     }
@@ -1794,7 +1980,7 @@ fn component_prop_state_value<'a>(
 ) -> Option<&'a StateValue> {
     match component_prop_for_expr(expr, props)? {
         ComponentProp::Literal(value) => Some(value),
-        ComponentProp::StateReference => None,
+        ComponentProp::StateReference(_) => None,
     }
 }
 
@@ -1974,132 +2160,199 @@ fn is_empty_event_handler(value: &JSXAttrValue) -> bool {
     })
 }
 
-fn is_input_state_assignment(value: &JSXAttrValue, state_name: &str) -> bool {
-    let Some(arrow) = arrow_from_handler(value) else {
-        return false;
-    };
-    let [Pat::Ident(parameter)] = arrow.params.as_slice() else {
-        return false;
-    };
-    let ArrowFunctionBody::Expr(body) = arrow.body.as_ref() else {
-        return false;
-    };
-    let Expr::Assign(assignment) = body.as_ref() else {
-        return false;
-    };
-    assignment.op == AssignOp::Assign
-        && assignment
-            .left
-            .as_ident()
-            .is_some_and(|ident| ident.id.sym.as_str() == state_name)
-        && matches!(
-            assignment.right.as_ref(),
-            Expr::Ident(value) if value.sym == parameter.id.sym
-        )
-}
-
-fn is_boolean_state_assignment(value: &JSXAttrValue, state_name: &str) -> bool {
-    let Some(arrow) = arrow_from_handler(value) else {
-        return false;
-    };
-    if !arrow.params.is_empty() {
-        return false;
+/// 把表达式解析成状态单元路径：`count` → "count"，`user.name` → "user.name"。
+fn expr_state_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::Member(member) => {
+            let Expr::Ident(object) = member.obj.as_ref() else {
+                return None;
+            };
+            let MemberProp::Ident(prop) = &member.prop else {
+                return None;
+            };
+            Some(format!("{}.{}", object.sym, prop.sym))
+        }
+        _ => None,
     }
-    let ArrowFunctionBody::Expr(body) = arrow.body.as_ref() else {
-        return false;
-    };
-    let Expr::Assign(assignment) = body.as_ref() else {
-        return false;
-    };
-    assignment.op == AssignOp::Assign
-        && assignment
-            .left
-            .as_ident()
-            .is_some_and(|ident| ident.id.sym.as_str() == state_name)
-        && matches!(assignment.right.as_ref(), Expr::Lit(Lit::Bool(value)) if value.value)
 }
 
-fn parse_state_mutation(value: &JSXAttrValue, state: &StateConfig) -> Option<StateMutation> {
-    let Some(arrow) = arrow_from_handler(value) else {
+/// 赋值左值对应的状态单元路径。
+fn assign_target_path(target: &AssignTarget) -> Option<String> {
+    match target {
+        AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => Some(ident.id.sym.to_string()),
+        AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
+            let Expr::Ident(object) = member.obj.as_ref() else {
+                return None;
+            };
+            let MemberProp::Ident(prop) = &member.prop else {
+                return None;
+            };
+            Some(format!("{}.{}", object.sym, prop.sym))
+        }
+        _ => None,
+    }
+}
+
+/// 收集所有 `const|let x = state(<初值>)` 声明；对象初值会展开成多个状态单元。
+/// 声明既可以写在模块顶层，也可以写在函数（例如 App）体里。
+fn collect_state_decls(module: &swc_ecma_ast::Module) -> Vec<StateDecl> {
+    let mut decls = Vec::new();
+    for item in &module.body {
+        if let ModuleItem::Stmt(statement) = item {
+            collect_state_decls_in_stmt(statement, &mut decls);
+        }
+    }
+    decls
+}
+
+fn collect_state_decls_in_stmt(statement: &Stmt, decls: &mut Vec<StateDecl>) {
+    match statement {
+        Stmt::Decl(Decl::Var(var)) => {
+            for declarator in &var.decls {
+                let Pat::Ident(binding) = &declarator.name else {
+                    continue;
+                };
+                let Some(init) = &declarator.init else {
+                    continue;
+                };
+                let Some(initial) = state_init_from_expr(init) else {
+                    continue;
+                };
+                decls.push(StateDecl {
+                    name: binding.id.sym.to_string(),
+                    initial,
+                });
+            }
+        }
+        Stmt::Decl(Decl::Fn(function)) => {
+            if let Some(body) = &function.function.body {
+                for statement in &body.stmts {
+                    collect_state_decls_in_stmt(statement, decls);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn state_init_from_expr(expr: &Expr) -> Option<StateInit> {
+    let Expr::Call(call) = expr else {
         return None;
     };
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Ident(ident) = callee.as_ref() else {
+        return None;
+    };
+    if ident.sym.as_str() != "state" || call.args.len() != 1 {
+        return None;
+    }
+    match call.args[0].expr.as_ref() {
+        Expr::Object(object) => {
+            let mut fields = Vec::new();
+            for prop in &object.props {
+                let PropOrSpread::Prop(prop) = prop else {
+                    return None;
+                };
+                let Prop::KeyValue(entry) = prop.as_ref() else {
+                    return None;
+                };
+                let name = match &entry.key {
+                    PropName::Ident(ident) => ident.sym.to_string(),
+                    PropName::Str(value) => value.value.to_string_lossy().into_owned(),
+                    _ => return None,
+                };
+                fields.push((name, state_value_from_expr(entry.value.as_ref())?));
+            }
+            (!fields.is_empty()).then_some(StateInit::Object(fields))
+        }
+        expr => state_value_from_expr(expr).map(StateInit::Scalar),
+    }
+}
+
+fn parse_state_mutation(
+    value: &JSXAttrValue,
+    cells: &[(String, StateValue)],
+) -> Option<StateMutation> {
+    let arrow = arrow_from_handler(value)?;
     let ArrowFunctionBody::Expr(body) = arrow.body.as_ref() else {
         return None;
     };
-    parse_state_mutation_expr(body, state)
+    let parameter = match arrow.params.as_slice() {
+        [Pat::Ident(ident)] => Some(ident.id.sym.to_string()),
+        _ => None,
+    };
+    parse_state_mutation_expr(body, cells, parameter.as_deref())
 }
 
 fn parse_lifecycle_mutation(
     arrow: &ArrowExpr,
-    state: Option<&StateConfig>,
+    cells: &[(String, StateValue)],
 ) -> Option<StateMutation> {
     match arrow.body.as_ref() {
         ArrowFunctionBody::FunctionBody(body) if body.stmts.is_empty() => Some(StateMutation::Noop),
-        ArrowFunctionBody::Expr(expression) => state
-            .and_then(|state| parse_state_mutation_expr(expression, state)),
+        ArrowFunctionBody::Expr(expression) => parse_state_mutation_expr(expression, cells, None),
         ArrowFunctionBody::FunctionBody(body) => {
             let [Stmt::Expr(statement)] = body.stmts.as_slice() else {
                 return None;
             };
-            let state = state?;
-            parse_state_mutation_expr(&statement.expr, state)
+            parse_state_mutation_expr(&statement.expr, cells, None)
         }
     }
 }
 
-fn parse_state_mutation_expr(body: &Expr, state: &StateConfig) -> Option<StateMutation> {
+fn parse_state_mutation_expr(
+    body: &Expr,
+    cells: &[(String, StateValue)],
+    input_parameter: Option<&str>,
+) -> Option<StateMutation> {
+    let cell_initial = |cell: &str| {
+        cells
+            .iter()
+            .find(|(path, _)| path == cell)
+            .map(|(_, value)| value.clone())
+    };
     match body {
-        Expr::Update(update)
-            if matches!(update.arg.as_ref(), Expr::Ident(ident) if ident.sym.as_str() == state.name) =>
-        {
+        Expr::Update(update) => {
+            let cell = expr_state_path(update.arg.as_ref())?;
+            cell_initial(&cell)?;
             match update.op {
-                UpdateOp::PlusPlus => Some(StateMutation::Increment),
-                UpdateOp::MinusMinus => Some(StateMutation::Decrement),
+                UpdateOp::PlusPlus => Some(StateMutation::Increment(cell)),
+                UpdateOp::MinusMinus => Some(StateMutation::Decrement(cell)),
             }
         }
-        Expr::Assign(assignment)
-            if assignment.op == AssignOp::Assign
-                && assignment
-                    .left
-                    .as_ident()
-                    .is_some_and(|ident| ident.id.sym.as_str() == state.name) =>
-        {
+        Expr::Assign(assignment) if assignment.op == AssignOp::Assign => {
+            let cell = assign_target_path(&assignment.left)?;
+            let initial = cell_initial(&cell)?;
             if let Expr::Bin(binary) = assignment.right.as_ref() {
-                if matches!(binary.left.as_ref(), Expr::Ident(ident) if ident.sym.as_str() == state.name)
+                let same_cell =
+                    expr_state_path(binary.left.as_ref()).as_deref() == Some(cell.as_str());
+                if same_cell
                     && matches!(binary.right.as_ref(), Expr::Lit(Lit::Num(number)) if number.value == 1.0)
                 {
                     return match binary.op {
-                        BinaryOp::Add => Some(StateMutation::Increment),
-                        BinaryOp::Sub => Some(StateMutation::Decrement),
+                        BinaryOp::Add => Some(StateMutation::Increment(cell)),
+                        BinaryOp::Sub => Some(StateMutation::Decrement(cell)),
                         _ => None,
                     };
                 }
             }
-            state_value_from_expr(assignment.right.as_ref()).map(StateMutation::Set)
-        }
-        Expr::Call(call) if !state.setter.is_empty() => {
-            let Callee::Expr(callee) = &call.callee else {
-                return None;
-            };
-            let Expr::Ident(callee) = callee.as_ref() else {
-                return None;
-            };
-            if callee.sym.as_str() != state.setter || call.args.len() != 1 {
-                return None;
-            }
-            let Expr::Bin(binary) = call.args[0].expr.as_ref() else {
-                return None;
-            };
-            if !matches!(binary.left.as_ref(), Expr::Ident(ident) if ident.sym.as_str() == state.name)
-                || !matches!(binary.right.as_ref(), Expr::Lit(Lit::Num(number)) if number.value == 1.0)
+            if let (Some(parameter), Expr::Ident(value)) =
+                (input_parameter, assignment.right.as_ref())
             {
-                return None;
+                if value.sym.as_str() == parameter && matches!(initial, StateValue::String(_)) {
+                    return Some(StateMutation::SetFromInput(cell));
+                }
             }
-            match binary.op {
-                BinaryOp::Add => Some(StateMutation::Increment),
-                BinaryOp::Sub => Some(StateMutation::Decrement),
-                _ => None,
+            if matches!(assignment.right.as_ref(), Expr::Lit(Lit::Bool(value)) if value.value)
+                && matches!(initial, StateValue::Boolean(_))
+            {
+                return Some(StateMutation::SetTrue(cell));
             }
+            state_value_from_expr(assignment.right.as_ref())
+                .map(|value| StateMutation::Set(cell, value))
         }
         _ => None,
     }
@@ -2120,58 +2373,6 @@ fn state_value_from_expr(expr: &Expr) -> Option<StateValue> {
     }
 }
 
-fn parse_state_config(src: &str) -> Option<StateConfig> {
-    if let Some(state_start) = src.find("state(") {
-        let binding_end = src[..state_start].rfind('=')?;
-        let name = src[..binding_end]
-            .split_whitespace()
-            .last()?
-            .trim_start_matches("const")
-            .trim_start_matches("let")
-            .trim();
-        let value_start = state_start + "state(".len();
-        let value_end = src[value_start..].find(')')? + value_start;
-        let initial_source = src[value_start..value_end].trim();
-        let initial = if initial_source == "true" {
-            StateValue::Boolean(true)
-        } else if initial_source == "false" {
-            StateValue::Boolean(false)
-        } else if (initial_source.starts_with('"') && initial_source.ends_with('"'))
-            || (initial_source.starts_with('\'') && initial_source.ends_with('\''))
-        {
-            StateValue::String(initial_source[1..initial_source.len() - 1].to_string())
-        } else {
-            StateValue::Number(initial_source.parse().ok()?)
-        };
-        return Some(StateConfig {
-            name: name.to_string(),
-            setter: String::new(),
-            initial,
-        });
-    }
-
-    let hook_start = src.find("useState(")?;
-    let binding_end = src[..hook_start].rfind(']')?;
-    let binding_start = src[..binding_end].rfind('[')?;
-    let bindings: Vec<_> = src[binding_start + 1..binding_end]
-        .split(',')
-        .map(str::trim)
-        .collect();
-    let name = *bindings.first()?;
-    let setter = *bindings.get(1)?;
-    if name.is_empty() || setter.is_empty() {
-        return None;
-    }
-    let value_start = hook_start + "useState(".len();
-    let value_end = src[value_start..].find(')')? + value_start;
-    let initial = StateValue::Number(src[value_start..value_end].trim().parse().ok()?);
-    Some(StateConfig {
-        name: name.to_string(),
-        setter: setter.to_string(),
-        initial,
-    })
-}
-
 // ---------- 新增部分：IRNode -> iOS LLVM IR ----------
 
 use inkwell::AddressSpace;
@@ -2185,7 +2386,26 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue,
 };
 
+/// 目标平台。IR 与布局共享，差异集中在视图类名、样式落点、事件与启动方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    Ios,
+    MacOs,
+    Android,
+}
+
+impl Platform {
+    fn is_mac(self) -> bool {
+        matches!(self, Self::MacOs)
+    }
+
+    fn is_android(self) -> bool {
+        matches!(self, Self::Android)
+    }
+}
+
 struct IosCodeGen<'ctx> {
+    platform: Platform,
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
@@ -2193,21 +2413,30 @@ struct IosCodeGen<'ctx> {
     objc_get_class: FunctionValue<'ctx>,
     objc_msg_send: FunctionValue<'ctx>,
     sel_register_name: FunctionValue<'ctx>,
-    state_label_globals: RefCell<Vec<GlobalValue<'ctx>>>,
+    /// 每个状态单元各自持有引用它的标签，更新时只触碰这一组。
+    state_label_globals: RefCell<HashMap<String, Vec<GlobalValue<'ctx>>>>,
     state_label_counter: Cell<usize>,
+    /// 所有状态单元（路径 + 初值），顺序决定全局变量名。
+    state_cells: RefCell<Vec<(String, StateValue)>>,
     scroll_fade_target_id: RefCell<Option<String>>,
     conditional_instances: RefCell<Vec<ConditionalRuntime<'ctx>>>,
     conditional_counter: Cell<usize>,
+    /// AppDelegate 类与 class_addMethod，macOS 上要等界面构建完再注册状态动作
+    delegate_class: RefCell<Option<PointerValue<'ctx>>>,
+    class_add_method_fn: RefCell<Option<FunctionValue<'ctx>>>,
 }
 
 #[derive(Clone)]
 struct ConditionalRuntime<'ctx> {
-    stack: GlobalValue<'ctx>,
+    cell: String,
+    /// 条件槽位视图（分支都挂在它下面）
+    slot: GlobalValue<'ctx>,
     true_view: GlobalValue<'ctx>,
     false_view: GlobalValue<'ctx>,
     active_state: GlobalValue<'ctx>,
-    true_index: usize,
-    false_index: usize,
+    /// 槽位高度约束，隐藏时把常量设为 0
+    height_constraint: GlobalValue<'ctx>,
+    slot_height: f64,
     true_mount: Vec<usize>,
     true_unmount: Vec<usize>,
     false_mount: Vec<usize>,
@@ -2216,11 +2445,21 @@ struct ConditionalRuntime<'ctx> {
 
 impl<'ctx> IosCodeGen<'ctx> {
     fn new(context: &'ctx Context) -> Self {
+        Self::new_for(context, Platform::Ios)
+    }
+
+    fn new_for(context: &'ctx Context, platform: Platform) -> Self {
         let module = context.create_module("ios_app");
         let builder = context.create_builder();
 
         // 设置目标三元组：arm64-apple-ios
-        module.set_triple(&TargetTriple::create("arm64-apple-ios"));
+        module.set_triple(&TargetTriple::create(if platform.is_mac() {
+            "arm64-apple-macosx14.0.0"
+        } else if platform.is_android() {
+            "aarch64-linux-android26"
+        } else {
+            "arm64-apple-ios"
+        }));
 
         let ptr_type = context.ptr_type(AddressSpace::default());
         let i8_ptr = context.ptr_type(AddressSpace::default());
@@ -2238,44 +2477,72 @@ impl<'ctx> IosCodeGen<'ctx> {
         let objc_msg_send = module.add_function("objc_msgSend", msg_send_type, None);
 
         Self {
+            platform,
             context,
             module,
             builder,
             objc_get_class,
             objc_msg_send,
             sel_register_name,
-            state_label_globals: RefCell::new(Vec::new()),
+            state_label_globals: RefCell::new(HashMap::new()),
             state_label_counter: Cell::new(0),
+            state_cells: RefCell::new(Vec::new()),
             scroll_fade_target_id: RefCell::new(None),
             conditional_instances: RefCell::new(Vec::new()),
             conditional_counter: Cell::new(0),
+            delegate_class: RefCell::new(None),
+            class_add_method_fn: RefCell::new(None),
         }
+    }
+
+    fn is_mac(&self) -> bool {
+        self.platform.is_mac()
+    }
+
+    fn view_class(&self) -> &'static str {
+        if self.is_mac() { "NSView" } else { "UIView" }
+    }
+
+    fn stack_class(&self) -> &'static str {
+        if self.is_mac() { "NSStackView" } else { "UIStackView" }
+    }
+
+    fn label_class(&self) -> &'static str {
+        if self.is_mac() { "NSTextField" } else { "UILabel" }
+    }
+
+    fn button_class(&self) -> &'static str {
+        if self.is_mac() { "NSButton" } else { "UIButton" }
+    }
+
+    fn scroll_class(&self) -> &'static str {
+        // macOS 首版把 ScrollView 当普通容器渲染（尚不支持滚动）
+        if self.is_mac() { "NSView" } else { "UIScrollView" }
+    }
+
+    fn input_class(&self) -> &'static str {
+        if self.is_mac() { "NSTextField" } else { "UITextField" }
+    }
+
+    fn image_view_class(&self) -> &'static str {
+        if self.is_mac() { "NSImageView" } else { "UIImageView" }
     }
 
     fn generate(&mut self, program: &UiProgram) -> Result<(), String> {
         if !program.errors.is_empty() {
             return Err(program.errors.join("\n"));
         }
-        if program.multiple_states {
-            return Err("this compiler phase supports one state(...) declaration per App".into());
+        if self.platform.is_android() {
+            return self.generate_android(program);
         }
-        if program.state.is_none()
-            && program.nodes.iter().any(node_has_input_binding)
-        {
+        *self.state_cells.borrow_mut() = state_cells(&program.states);
+        if program.states.is_empty() && program.nodes.iter().any(node_has_input_binding) {
             return Err("Input onInput requires a state(...) declaration".into());
         }
         if let Some(config) = &program.scroll_fade {
             *self.scroll_fade_target_id.borrow_mut() = Some(config.target_id.clone());
             if count_scroll_fade_targets(&program.nodes) > 1 {
                 return Err("this compiler phase supports one ScrollView fadeTarget per App".into());
-            }
-            if program.nodes.iter().any(node_has_conditional)
-                && !matches!(
-                    program.state.as_ref().map(|state| &state.initial),
-                    Some(StateValue::Boolean(_))
-                )
-            {
-                return Err("conditional rendering requires a boolean state(...) value".into());
             }
             if !config.distance.is_finite() || config.distance <= 0.0 {
                 return Err("ScrollView fadeDistance must be greater than zero".into());
@@ -2307,6 +2574,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 return Err("backgroundExtendsTo: \"top\" requires a backgroundColor".into());
             }
         }
+        validate_ignores_safe_area_views(&program.nodes)?;
 
         // Create the entry point before emitting runtime calls for the view tree.
         let i32_type = self.context.i32_type();
@@ -2320,8 +2588,10 @@ impl<'ctx> IosCodeGen<'ctx> {
         let global_view = self.module.add_global(ptr_type, None, "g_root_view");
         global_view.set_initializer(&ptr_type.const_null());
 
-        if program.state.is_some() {
-            let state_global = self.module.add_global(ptr_type, None, "g_state_value");
+        for index in 0..self.state_cells.borrow().len() {
+            let state_global = self
+                .module
+                .add_global(ptr_type, None, &format!("g_state_cell_{index}"));
             state_global.set_initializer(&ptr_type.const_null());
         }
         if program.scroll_fade.is_some() {
@@ -2342,8 +2612,63 @@ impl<'ctx> IosCodeGen<'ctx> {
                     .set_initializer(&ptr_type.const_null());
             }
         }
-        // Build the view hierarchy from the app delegate after UIKit has launched.
+        if self.is_mac() {
+            self.register_flipped_view_class()?;
+            for name in ["g_window", "g_app_delegate"] {
+                let global = self.module.add_global(ptr_type, None, name);
+                global.set_initializer(&ptr_type.const_null());
+            }
+        }
+        // macOS：先把界面构建逻辑生成成一个函数，标签表在生成过程中就绪，
+        // 之后注册 AppDelegate 的状态动作才能带上标签刷新。
+        let ui_build_fn = if self.is_mac() {
+            Some(self.build_ui_function(program)?)
+        } else {
+            None
+        };
+        // Build the view hierarchy from the app delegate after the app has launched.
         self.build_app_delegate_class(program)?;
+
+        if self.is_mac() {
+            let app = self
+                .send_msg_ptr(
+                    self.get_class("NSApplication")?,
+                    self.get_selector("sharedApplication")?,
+                    &[],
+                )?
+                .ok_or("NSApplication sharedApplication returned void")?;
+            self.send_msg_void(
+                app,
+                "setActivationPolicy:",
+                &[self.context.i64_type().const_int(0, false).into()],
+            )?;
+            let delegate_class = self.get_class("AppDelegate")?;
+            let delegate = self
+                .send_msg_ptr(delegate_class, self.get_selector("alloc")?, &[])?
+                .ok_or("AppDelegate alloc returned void")?;
+            let delegate = self
+                .send_msg_ptr(delegate, self.get_selector("init")?, &[])?
+                .ok_or("AppDelegate init returned void")?;
+            if let Some(global) = self.module.get_global("g_app_delegate") {
+                self.builder
+                    .build_store(global.as_pointer_value(), delegate)
+                    .map_err(|e| e.to_string())?;
+            }
+            self.send_msg_void(app, "setDelegate:", &[delegate.into()])?;
+            // 界面构建逻辑已预先生成到 lumen_build_ui 里，这里只是调用
+            let ui_fn = ui_build_fn.ok_or("macOS UI build function was not generated")?;
+            self.builder
+                .build_call(ui_fn, &[delegate.into()], "")
+                .map_err(|e| e.to_string())?;
+            self.send_msg_void(app, "run", &[])?;
+            self.builder
+                .build_return(Some(&i32_type.const_int(0, false)))
+                .map_err(|e| e.to_string())?;
+            self.module.verify().map_err(|e| e.to_string())?;
+            self.module.print_to_file("out.ll").map_err(|e| e.to_string())?;
+            println!("LLVM IR 已写入 out.ll (target: arm64-apple-macos)");
+            return Ok(());
+        }
 
         // Get argc and argv for UIApplicationMain.
         let argc = main_fn.get_nth_param(0).unwrap().into_int_value();
@@ -2386,6 +2711,261 @@ impl<'ctx> IosCodeGen<'ctx> {
         Ok(())
     }
 
+    /// 从 JNIEnv 的函数表按索引取出函数指针（JNINativeInterface 字段顺序由 JNI 规范固定）。
+    fn jni_table_fn(&self, env: PointerValue<'ctx>, index: u64) -> Result<PointerValue<'ctx>, String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let table = self
+            .builder
+            .build_load(ptr_type, env, "jni_table")
+            .map_err(|e| e.to_string())?
+            .into_pointer_value();
+        let slot = unsafe {
+            self.builder.build_gep(
+                ptr_type,
+                table,
+                &[self.context.i64_type().const_int(index, false)],
+                "jni_slot",
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(self
+            .builder
+            .build_load(ptr_type, slot, "jni_fn")
+            .map_err(|e| e.to_string())?
+            .into_pointer_value())
+    }
+
+    fn jni_call(
+        &self,
+        env: PointerValue<'ctx>,
+        index: u64,
+        fn_type: inkwell::types::FunctionType<'ctx>,
+        args: &[BasicMetadataValueEnum<'ctx>],
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let fn_ptr = self.jni_table_fn(env, index)?;
+        let call = self
+            .builder
+            .build_indirect_call(fn_type, fn_ptr, args, "jni_result")
+            .map_err(|e| e.to_string())?;
+        Ok(match call.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(value) => Some(value),
+            inkwell::values::ValueKind::Instruction(_) => None,
+        })
+    }
+
+    /// 安卓入口：生成 JNI 导出和整套原生控件构建逻辑，实现见 `android` 模块。
+    fn generate_android(&self, program: &UiProgram) -> Result<(), String> {
+        android::emit(self, program)?;
+        self.module
+            .print_to_file("out.ll")
+            .map_err(|error| error.to_string())?;
+        println!("LLVM IR 已写入 out.ll (target: aarch64-linux-android26)");
+        Ok(())
+    }
+
+    /// 把界面构建逻辑生成成独立函数 `void lumen_build_ui(id delegate)`。
+    fn build_ui_function(&self, program: &UiProgram) -> Result<FunctionValue<'ctx>, String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
+        let function = self.module.add_function("lumen_build_ui", fn_type, None);
+        let saved = self.builder.get_insert_block().unwrap();
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+        let receiver = function
+            .get_nth_param(0)
+            .ok_or("lumen_build_ui receiver parameter is missing")?
+            .into_pointer_value();
+        self.emit_ui_construction(program, receiver)?;
+        self.builder
+            .build_return(None)
+            .map_err(|e| e.to_string())?;
+        self.builder.position_at_end(saved);
+        Ok(function)
+    }
+
+    /// 给 AppDelegate 注册 stateActionN: 方法。
+    /// 必须在界面构建之后调用：回调里要按单元刷新标签，依赖构建期登记的标签表。
+    fn register_state_action_methods(
+        &self,
+        program: &UiProgram,
+        class_add_method: FunctionValue<'ctx>,
+        app_delegate_class: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        for (index, action) in program.state_actions.iter().enumerate() {
+            let method = self.build_state_callback_method(action, index)?;
+            let selector = self.get_selector(&format!("stateAction{index}:"))?;
+            let encoding = self
+                .builder
+                .build_global_string_ptr("v@:@", &format!("state_action_{index}_encoding"))
+                .map_err(|error| error.to_string())?;
+            self.builder
+                .build_call(
+                    class_add_method,
+                    &[
+                        app_delegate_class.into(),
+                        selector.into(),
+                        method.as_global_value().as_pointer_value().into(),
+                        encoding.as_pointer_value().into(),
+                    ],
+                    "",
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// macOS 的输入框回调：`- (void)controlTextDidChange:(NSNotification *)note`。
+    /// 从通知里取出 NSTextField，和构建期登记的每个 onInput 输入框比身份，
+    /// 命中就调对应的 stateAction<k>:（参数就是输入框自己，动作里用 stringValue 取值）。
+    fn build_input_delegate_method(
+        &self,
+        program: &UiProgram,
+    ) -> Result<Option<FunctionValue<'ctx>>, String> {
+        let mut actions = Vec::new();
+        collect_input_actions(&program.nodes, &mut actions);
+        if actions.is_empty() {
+            return Ok(None);
+        }
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let fn_type = self
+            .context
+            .void_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
+        let function = self
+            .module
+            .add_function("app_delegate_control_text_did_change", fn_type, None);
+        let saved = self.builder.get_insert_block();
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let this = function
+            .get_nth_param(0)
+            .ok_or("delegate receiver is missing")?
+            .into_pointer_value();
+        let notification = function
+            .get_nth_param(2)
+            .ok_or("notification parameter is missing")?
+            .into_pointer_value();
+        let field = self
+            .send_msg_ptr(notification, self.get_selector("object")?, &[])?
+            .ok_or("NSNotification object returned void")?;
+        let field_bits = self
+            .builder
+            .build_ptr_to_int(field, self.context.i64_type(), "edited_field")
+            .map_err(|e| e.to_string())?;
+
+        let done = self.context.append_basic_block(function, "done");
+        for action in actions {
+            let name = format!("g_input_source_{action}");
+            let global = self
+                .module
+                .get_global(&name)
+                .ok_or_else(|| format!("{name} was not created"))?;
+            let stored = self
+                .builder
+                .build_load(ptr_type, global.as_pointer_value(), "input_source")
+                .map_err(|e| e.to_string())?
+                .into_pointer_value();
+            let stored_bits = self
+                .builder
+                .build_ptr_to_int(stored, self.context.i64_type(), "input_source_bits")
+                .map_err(|e| e.to_string())?;
+            let same = self
+                .builder
+                .build_int_compare(IntPredicate::EQ, stored_bits, field_bits, "same_input")
+                .map_err(|e| e.to_string())?;
+            let hit = self
+                .context
+                .append_basic_block(function, &format!("input_{action}"));
+            let next = self
+                .context
+                .append_basic_block(function, &format!("input_{action}_next"));
+            self.builder
+                .build_conditional_branch(same, hit, next)
+                .map_err(|e| e.to_string())?;
+            self.builder.position_at_end(hit);
+            self.send_msg_void(this, &format!("stateAction{action}:"), &[field.into()])?;
+            self.builder
+                .build_unconditional_branch(done)
+                .map_err(|e| e.to_string())?;
+            self.builder.position_at_end(next);
+        }
+        self.builder
+            .build_unconditional_branch(done)
+            .map_err(|e| e.to_string())?;
+        self.builder.position_at_end(done);
+        self.builder.build_return(None).map_err(|e| e.to_string())?;
+        if let Some(saved) = saved {
+            self.builder.position_at_end(saved);
+        }
+        Ok(Some(function))
+    }
+
+    /// 记下 onInput 输入框，供 controlTextDidChange: 里比对身份。
+    fn store_input_source(
+        &self,
+        action: usize,
+        input: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        let name = format!("g_input_source_{action}");
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let global = match self.module.get_global(&name) {
+            Some(global) => global,
+            None => {
+                let global = self.module.add_global(ptr_type, None, &name);
+                global.set_initializer(&ptr_type.const_null());
+                global
+            }
+        };
+        self.builder
+            .build_store(global.as_pointer_value(), input)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    /// `receiver` 同时作为控件的事件目标（按钮的 target）。
+    fn emit_ui_construction(
+        &self,
+        program: &UiProgram,
+        receiver: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        let cells = self.state_cells.borrow().clone();
+        for (index, (_, initial)) in cells.iter().enumerate() {
+            let initial_value = self.create_nsstring(&initial.display_value())?;
+            let state_global = self
+                .module
+                .get_global(&format!("g_state_cell_{index}"))
+                .ok_or("state value global was not created")?;
+            self.builder
+                .build_store(state_global.as_pointer_value(), initial_value)
+                .map_err(|error| error.to_string())?;
+        }
+        drop(cells);
+
+        let event_target = Some(receiver);
+        let root_view = if let Some(node) = program.nodes.first() {
+            self.codegen_node(node, event_target, 0.0, 0.0, 350.0, 700.0, None, true)?
+        } else {
+            self.create_objc_instance_with_frame(self.view_class(), self.screen_bounds()?)?
+        };
+        let root_view_global = self
+            .module
+            .get_global("g_root_view")
+            .ok_or("root view global was not created")?;
+        self.builder
+            .build_store(root_view_global.as_pointer_value(), root_view)
+            .map_err(|e| e.to_string())?;
+
+        self.build_show_window_logic(program.nodes.first())?;
+
+        let mut initial_mount_actions = Vec::new();
+        collect_initial_mount_actions(&program.nodes, &mut initial_mount_actions);
+        for action in initial_mount_actions {
+            self.emit_lifecycle_action(receiver, Some(action))?;
+        }
+        Ok(())
+    }
+
     /// 动态构建 AppDelegate 类，并实现 application:didFinishLaunchingWithOptions: 方法
     fn build_app_delegate_class(&self, program: &UiProgram) -> Result<(), String> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -2394,15 +2974,24 @@ impl<'ctx> IosCodeGen<'ctx> {
         // 声明 Objective-C 运行时函数
         // Class objc_allocateClassPair(Class superclass, const char *name, size_t extraBytes)
         let allocate_class_type = ptr_type.fn_type(&[ptr_type.into(), i8_ptr.into(), self.context.i64_type().into()], false);
-        let objc_allocate_class_pair = self.module.add_function("objc_allocateClassPair", allocate_class_type, None);
+        let objc_allocate_class_pair = self
+            .module
+            .get_function("objc_allocateClassPair")
+            .unwrap_or_else(|| self.module.add_function("objc_allocateClassPair", allocate_class_type, None));
 
         // BOOL class_addMethod(Class cls, SEL name, IMP imp, const char *types)
         let add_method_type = self.context.bool_type().fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into(), i8_ptr.into()], false);
-        let class_add_method = self.module.add_function("class_addMethod", add_method_type, None);
+        let class_add_method = self
+            .module
+            .get_function("class_addMethod")
+            .unwrap_or_else(|| self.module.add_function("class_addMethod", add_method_type, None));
 
         // void objc_registerClassPair(Class cls)
         let register_class_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
-        let objc_register_class_pair = self.module.add_function("objc_registerClassPair", register_class_type, None);
+        let objc_register_class_pair = self
+            .module
+            .get_function("objc_registerClassPair")
+            .unwrap_or_else(|| self.module.add_function("objc_registerClassPair", register_class_type, None));
 
         // 获取 NSObject 类作为父类
         let nsobject = self.get_class("NSObject")?;
@@ -2431,74 +3020,64 @@ impl<'ctx> IosCodeGen<'ctx> {
             }
         };
 
-        // Implement application:didFinishLaunchingWithOptions:, which returns BOOL.
+        // iOS: -application:didFinishLaunchingWithOptions: (返回 BOOL)
+        // macOS: -applicationDidFinishLaunching: (返回 void)
         let bool_type = self.context.i8_type();
-        let did_finish_launching_fn_type = bool_type.fn_type(&[
-            ptr_type.into(), // self
-            ptr_type.into(), // _cmd
-            ptr_type.into(), // application
-            ptr_type.into(), // launchOptions
-        ], false);
+        let did_finish_launching_fn_type = if self.is_mac() {
+            self.context.void_type().fn_type(
+                &[
+                    ptr_type.into(), // self
+                    ptr_type.into(), // _cmd
+                    ptr_type.into(), // notification
+                ],
+                false,
+            )
+        } else {
+            bool_type.fn_type(
+                &[
+                    ptr_type.into(), // self
+                    ptr_type.into(), // _cmd
+                    ptr_type.into(), // application
+                    ptr_type.into(), // launchOptions
+                ],
+                false,
+            )
+        };
         let did_finish_launching_fn = self.module.add_function("app_delegate_did_finish_launching", did_finish_launching_fn_type, None);
         let fn_entry = self.context.append_basic_block(did_finish_launching_fn, "entry");
         // 保存当前的插入点，稍后恢复
         let saved_block = self.builder.get_insert_block().unwrap();
         self.builder.position_at_end(fn_entry);
 
-        if let Some(state) = &program.state {
-            let initial_value = self.create_nsstring(&state.initial.display_value())?;
-            let state_global = self
-                .module
-                .get_global("g_state_value")
-                .ok_or("state value global was not created")?;
-            self.builder
-                .build_store(state_global.as_pointer_value(), initial_value)
-                .map_err(|error| error.to_string())?;
-        }
-
-        let event_target = Some(
-            did_finish_launching_fn
-                .get_nth_param(0)
-                .ok_or("app delegate self parameter is missing")?
-                .into_pointer_value(),
-        );
-        let root_view = if let Some(node) = program.nodes.first() {
-            self.codegen_node(node, event_target, 0.0, 0.0, 350.0, 700.0, None, true)?
-        } else {
-            self.create_objc_instance_with_frame("UIView", self.screen_bounds()?)?
-        };
-        let root_view_global = self
-            .module
-            .get_global("g_root_view")
-            .ok_or("root view global was not created")?;
-        self.builder
-            .build_store(root_view_global.as_pointer_value(), root_view)
-            .map_err(|e| e.to_string())?;
-
-        // Create the window and attach the generated root view.
-        self.build_show_window_logic(program.nodes.first())?;
         let delegate = did_finish_launching_fn
             .get_nth_param(0)
             .ok_or("app delegate self parameter is missing")?
             .into_pointer_value();
-        let mut initial_mount_actions = Vec::new();
-        collect_initial_mount_actions(&program.nodes, &mut initial_mount_actions);
-        for action in initial_mount_actions {
-            self.emit_lifecycle_action(delegate, Some(action))?;
+        if !self.is_mac() {
+            // macOS 的界面由 main 直接构建，这里保持空实现
+            self.emit_ui_construction(program, delegate)?;
         }
 
-        self.builder
-            .build_return(Some(&bool_type.const_int(1, false)))
-            .map_err(|e| e.to_string())?;
+        if self.is_mac() {
+            self.builder.build_return(None).map_err(|e| e.to_string())?;
+        } else {
+            self.builder
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .map_err(|e| e.to_string())?;
+        }
         // 恢复插入点
         self.builder.position_at_end(saved_block);
 
         // 将方法添加到类中
-        let sel_register = self.get_selector("application:didFinishLaunchingWithOptions:")?;
-        // Objective-C type encoding: BOOL, self, _cmd, application, launchOptions.
+        let (launch_selector, launch_encoding) = if self.is_mac() {
+            ("applicationDidFinishLaunching:", "v@:@")
+        } else {
+            ("application:didFinishLaunchingWithOptions:", "c@:@@")
+        };
+        let sel_register = self.get_selector(launch_selector)?;
         let type_encoding = self
             .builder
-            .build_global_string_ptr("c@:@@", "method_type_encoding")
+            .build_global_string_ptr(launch_encoding, "method_type_encoding")
             .map_err(|e| e.to_string())?;
         
         self.builder
@@ -2514,14 +3093,18 @@ impl<'ctx> IosCodeGen<'ctx> {
             )
             .map_err(|e| e.to_string())?;
 
+        *self.delegate_class.borrow_mut() = Some(app_delegate_class);
+        *self.class_add_method_fn.borrow_mut() = Some(class_add_method);
         if !program.state_actions.is_empty() {
-            for (index, action) in program.state_actions.iter().enumerate() {
-                let method = self.build_state_callback_method(action, index)?;
-                let selector_name = format!("stateAction{index}:");
-                let selector = self.get_selector(&selector_name)?;
+            self.register_state_action_methods(program, class_add_method, app_delegate_class)?;
+        }
+        // macOS：输入框的实时回写靠 delegate 的 controlTextDidChange:
+        if self.is_mac() {
+            if let Some(method) = self.build_input_delegate_method(program)? {
+                let selector = self.get_selector("controlTextDidChange:")?;
                 let encoding = self
                     .builder
-                    .build_global_string_ptr("v@:@", &format!("state_action_{index}_encoding"))
+                    .build_global_string_ptr("v@:@", "input_delegate_encoding")
                     .map_err(|error| error.to_string())?;
                 self.builder
                     .build_call(
@@ -2537,28 +3120,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                     .map_err(|error| error.to_string())?;
             }
         }
-        if program.state.is_some() {
-            let input_callback = self.build_state_input_callback_method()?;
-            let input_selector = self.get_selector("updateStateFromInput:")?;
-            let input_encoding = self
-                .builder
-                .build_global_string_ptr("v@:@", "input_callback_encoding")
-                .map_err(|error| error.to_string())?;
-            self.builder
-                .build_call(
-                    class_add_method,
-                    &[
-                        app_delegate_class.into(),
-                        input_selector.into(),
-                        input_callback.as_global_value().as_pointer_value().into(),
-                        input_encoding.as_pointer_value().into(),
-                    ],
-                    "",
-                )
-                .map_err(|error| error.to_string())?;
-        }
 
-        if let Some(config) = &program.scroll_fade {
+        if let Some(config) = program.scroll_fade.as_ref().filter(|_| !self.is_mac()) {
             let callback = self.build_scroll_fade_callback(config)?;
             let selector = self.get_selector("scrollViewDidScroll:")?;
             let encoding = self
@@ -2579,27 +3142,6 @@ impl<'ctx> IosCodeGen<'ctx> {
                 .map_err(|error| error.to_string())?;
         }
 
-        let focus_callback = self.build_focus_event_callback_method(
-            program.nodes.iter().any(node_has_focus_state_update),
-        )?;
-        let focus_selector = self.get_selector("focusEvent:")?;
-        let focus_encoding = self
-            .builder
-            .build_global_string_ptr("v@:@", "focus_callback_encoding")
-            .map_err(|error| error.to_string())?;
-        self.builder
-            .build_call(
-                class_add_method,
-                &[
-                    app_delegate_class.into(),
-                    focus_selector.into(),
-                    focus_callback.as_global_value().as_pointer_value().into(),
-                    focus_encoding.as_pointer_value().into(),
-                ],
-                "",
-            )
-            .map_err(|error| error.to_string())?;
-
         // 注册类
         self.builder
             .build_call(
@@ -2612,6 +3154,17 @@ impl<'ctx> IosCodeGen<'ctx> {
         Ok(())
     }
 
+    /// 状态单元对应的存储全局变量名。
+    fn cell_global_name(&self, cell: &str) -> Option<String> {
+        self.state_cells
+            .borrow()
+            .iter()
+            .position(|(path, _)| path == cell)
+            .map(|index| format!("g_state_cell_{index}"))
+    }
+
+    /// 一个状态动作对应一个 Objective-C 方法：读当前值 → 计算 → 写回 →
+    /// 只刷新引用该单元的标签和条件视图。
     fn build_state_callback_method(
         &self,
         mutation: &StateMutation,
@@ -2632,35 +3185,55 @@ impl<'ctx> IosCodeGen<'ctx> {
             .ok_or("missing insertion block while generating state callback")?;
         self.builder.position_at_end(entry);
 
-        if *mutation == StateMutation::Noop {
+        let Some(cell) = mutation.cell() else {
             self.builder
                 .build_return(None)
                 .map_err(|e| e.to_string())?;
             self.builder.position_at_end(saved_block);
             return Ok(callback);
-        }
-
+        };
+        let state_global_name = self
+            .cell_global_name(cell)
+            .ok_or_else(|| format!("state cell '{cell}' was not collected"))?;
         let state_global = self
             .module
-            .get_global("g_state_value")
+            .get_global(&state_global_name)
             .ok_or("state value global was not created")?;
         let state_ptr = state_global.as_pointer_value();
+
         let text = match mutation {
-            StateMutation::Set(value) => self.create_nsstring(&value.display_value())?,
-            StateMutation::Increment | StateMutation::Decrement => {
-                let current = self.builder
+            StateMutation::Set(_, value) => self.create_nsstring(&value.display_value())?,
+            StateMutation::SetTrue(_) => self.create_nsstring("true")?,
+            StateMutation::SetFromInput(_) => {
+                let sender = callback
+                    .get_nth_param(2)
+                    .ok_or("input sender parameter is missing")?
+                    .into_pointer_value();
+                // UITextField 用 text，AppKit 的 NSTextField 用 stringValue
+                let selector = if self.is_mac() { "stringValue" } else { "text" };
+                self.send_msg_ptr(sender, self.get_selector(selector)?, &[])?
+                    .ok_or("text field text returned void")?
+            }
+            StateMutation::Increment(_) | StateMutation::Decrement(_) => {
+                let current = self
+                    .builder
                     .build_load(ptr_type, state_ptr, "state_current")
                     .map_err(|e| e.to_string())?
                     .into_pointer_value();
-                let current = self.send_msg_impl(
-                    current,
-                    self.get_selector("longLongValue")?,
-                    &[],
-                    BasicTypeEnum::IntType(self.context.i64_type()),
-                )?
-                .ok_or("NSString longLongValue returned void")?
-                .into_int_value();
-                let delta = if *mutation == StateMutation::Increment { 1 } else { -1 };
+                let current = self
+                    .send_msg_impl(
+                        current,
+                        self.get_selector("longLongValue")?,
+                        &[],
+                        BasicTypeEnum::IntType(self.context.i64_type()),
+                    )?
+                    .ok_or("NSString longLongValue returned void")?
+                    .into_int_value();
+                let delta = if matches!(mutation, StateMutation::Increment(_)) {
+                    1
+                } else {
+                    -1
+                };
                 let next = self
                     .builder
                     .build_int_add(
@@ -2688,7 +3261,10 @@ impl<'ctx> IosCodeGen<'ctx> {
                     ],
                     true,
                 );
-                let snprintf = self.module.add_function("snprintf", snprintf_type, None);
+                let snprintf = self
+                    .module
+                    .get_function("snprintf")
+                    .unwrap_or_else(|| self.module.add_function("snprintf", snprintf_type, None));
                 self.builder
                     .build_call(
                         snprintf,
@@ -2703,103 +3279,22 @@ impl<'ctx> IosCodeGen<'ctx> {
                     .map_err(|e| e.to_string())?;
                 self.create_nsstring_from_cstr(buffer.as_pointer_value())?
             }
-            StateMutation::Noop => {
-                return Err("lifecycle no-op actions do not have a state callback body".into());
-            }
+            StateMutation::Noop => return Err("lifecycle no-op actions have no state body".into()),
         };
         self.builder
             .build_store(state_ptr, text)
             .map_err(|e| e.to_string())?;
-        self.update_state_labels(text)?;
-        let receiver = callback.get_nth_param(0)
+        self.update_cell_labels(cell, text)?;
+        let receiver = callback
+            .get_nth_param(0)
             .ok_or("state callback self parameter is missing")?
             .into_pointer_value();
-        self.update_conditional_views(callback, receiver, text)?;
+        self.update_conditional_views(callback, receiver, cell, text)?;
         self.builder
             .build_return(None)
             .map_err(|e| e.to_string())?;
         self.builder.position_at_end(saved_block);
 
-        Ok(callback)
-    }
-
-    fn build_state_input_callback_method(&self) -> Result<FunctionValue<'ctx>, String> {
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-        let callback_type = self.context.void_type().fn_type(
-            &[ptr_type.into(), ptr_type.into(), ptr_type.into()],
-            false,
-        );
-        let callback = self
-            .module
-            .add_function("app_delegate_update_state_from_input", callback_type, None);
-        let entry = self.context.append_basic_block(callback, "entry");
-        let saved_block = self
-            .builder
-            .get_insert_block()
-            .ok_or("missing insertion block while generating input callback")?;
-        self.builder.position_at_end(entry);
-
-        let sender = callback
-            .get_nth_param(2)
-            .ok_or("input sender parameter is missing")?
-            .into_pointer_value();
-        let value = self
-            .send_msg_ptr(sender, self.get_selector("text")?, &[])?
-            .ok_or("UITextField text returned void")?;
-        let state_global = self
-            .module
-            .get_global("g_state_value")
-            .ok_or("state value global was not created")?;
-        self.builder
-            .build_store(state_global.as_pointer_value(), value)
-            .map_err(|error| error.to_string())?;
-        self.update_state_labels(value)?;
-        let receiver = callback.get_nth_param(0)
-            .ok_or("input callback self parameter is missing")?
-            .into_pointer_value();
-        self.update_conditional_views(callback, receiver, value)?;
-        self.builder
-            .build_return(None)
-            .map_err(|error| error.to_string())?;
-        self.builder.position_at_end(saved_block);
-        Ok(callback)
-    }
-
-    fn build_focus_event_callback_method(
-        &self,
-        updates_boolean_state: bool,
-    ) -> Result<FunctionValue<'ctx>, String> {
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-        let callback_type = self.context.void_type().fn_type(
-            &[ptr_type.into(), ptr_type.into(), ptr_type.into()],
-            false,
-        );
-        let callback = self
-            .module
-            .add_function("app_delegate_focus_event", callback_type, None);
-        let entry = self.context.append_basic_block(callback, "entry");
-        let saved_block = self
-            .builder
-            .get_insert_block()
-            .ok_or("missing insertion block while generating focus callback")?;
-        self.builder.position_at_end(entry);
-        if updates_boolean_state {
-            let value = self.create_nsstring("true")?;
-            let state_global = self
-                .module
-                .get_global("g_state_value")
-                .ok_or("state value global was not created")?;
-            self.builder
-                .build_store(state_global.as_pointer_value(), value)
-                .map_err(|error| error.to_string())?;
-            self.update_state_labels(value)?;
-            let receiver = callback.get_nth_param(0)
-                .ok_or("focus callback self parameter is missing")?
-                .into_pointer_value();
-            self.update_conditional_views(callback, receiver, value)?;
-        }
-        self.builder.build_return(None).map_err(|error| error.to_string())?;
-        self.builder.position_at_end(saved_block);
         Ok(callback)
     }
 
@@ -2982,9 +3477,13 @@ impl<'ctx> IosCodeGen<'ctx> {
         Ok(callback)
     }
 
-    fn update_state_labels(&self, value: PointerValue<'ctx>) -> Result<(), String> {
+    fn update_cell_labels(&self, cell: &str, value: PointerValue<'ctx>) -> Result<(), String> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
-        for (index, label_global) in self.state_label_globals.borrow().iter().enumerate() {
+        let globals = self.state_label_globals.borrow();
+        let Some(labels) = globals.get(cell) else {
+            return Ok(());
+        };
+        for (index, label_global) in labels.iter().enumerate() {
             let label = self
                 .builder
                 .build_load(
@@ -2994,7 +3493,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 )
                 .map_err(|error| error.to_string())?
                 .into_pointer_value();
-            self.send_msg_void(label, "setText:", &[value.into()])?;
+            self.set_label_text(label, value)?;
         }
         Ok(())
     }
@@ -3070,9 +3569,15 @@ impl<'ctx> IosCodeGen<'ctx> {
         &self,
         callback: FunctionValue<'ctx>,
         receiver: PointerValue<'ctx>,
+        cell: &str,
         state_value: PointerValue<'ctx>,
     ) -> Result<(), String> {
-        if self.conditional_instances.borrow().is_empty() {
+        if !self
+            .conditional_instances
+            .borrow()
+            .iter()
+            .any(|runtime| runtime.cell == cell)
+        {
             return Ok(());
         }
         let raw_state = self
@@ -3094,6 +3599,8 @@ impl<'ctx> IosCodeGen<'ctx> {
             )
             .map_err(|error| error.to_string())?;
 
+        // 注意：这里必须用条件在 conditional_instances 里的**真实下标**，不能用过滤后的序号，
+        // 因为 g_conditional_height_<n> 这些全局变量是按创建顺序编号的。
         for (index, runtime) in self
             .conditional_instances
             .borrow()
@@ -3101,6 +3608,9 @@ impl<'ctx> IosCodeGen<'ctx> {
             .cloned()
             .enumerate()
         {
+            if runtime.cell != cell {
+                continue;
+            }
             let active_raw = self
                 .builder
                 .build_load(
@@ -3170,21 +3680,36 @@ impl<'ctx> IosCodeGen<'ctx> {
                 .into_pointer_value();
             let stack = load_view(
                 &self.builder,
-                runtime.stack,
+                runtime.slot,
                 &format!("conditional_stack_{index}"),
             )?;
-            self.send_msg_void(stack, "removeArrangedSubview:", &[old_view.into()])?;
-            self.send_msg_void(
-                old_view,
-                "setHidden:",
-                &[self.context.i8_type().const_int(1, false).into()],
-            )?;
+            // 卸载旧分支：视图和它的边约束一起离开层级
             self.send_msg_void(old_view, "removeFromSuperview", &[])?;
 
             let no_new_branch = self
                 .builder
                 .build_is_null(new_view, "conditional_no_new_branch")
                 .map_err(|error| error.to_string())?;
+            // 槽位高度：有分支显示时是编译期算出的高度，否则收缩为 0
+            let height_global = self
+                .module
+                .get_global(&format!("g_conditional_height_{index}"))
+                .ok_or("conditional height global was not created")?;
+            let height_constraint = self
+                .builder
+                .build_load(ptr_type, height_global.as_pointer_value(), "conditional_height")
+                .map_err(|error| error.to_string())?
+                .into_pointer_value();
+            let height_value = self
+                .builder
+                .build_select(
+                    no_new_branch,
+                    self.context.f64_type().const_float(0.0),
+                    self.context.f64_type().const_float(runtime.slot_height),
+                    "conditional_height_value",
+                )
+                .map_err(|error| error.to_string())?;
+            self.send_msg_void(height_constraint, "setConstant:", &[height_value.into()])?;
             let insert_block = self.context.append_basic_block(
                 callback,
                 &format!("conditional_insert_{index}"),
@@ -3197,27 +3722,18 @@ impl<'ctx> IosCodeGen<'ctx> {
                 .build_conditional_branch(no_new_branch, layout_block, insert_block)
                 .map_err(|error| error.to_string())?;
             self.builder.position_at_end(insert_block);
-            self.send_msg_void(
-                new_view,
-                "setHidden:",
-                &[self.context.i8_type().const_zero().into()],
-            )?;
-            let true_index = self.context.i64_type().const_int(runtime.true_index as u64, false);
-            let false_index = self.context.i64_type().const_int(runtime.false_index as u64, false);
-            let insertion_index = self
-                .builder
-                .build_select(new_state, true_index, false_index, "conditional_index")
-                .map_err(|error| error.to_string())?;
-            self.send_msg_void(
-                stack,
-                "insertArrangedSubview:atIndex:",
-                &[new_view.into(), insertion_index.into()],
-            )?;
+            // 挂载新分支并重建它的边约束（约束随旧视图一起被移除过）
+            self.send_msg_void(stack, "addSubview:", &[new_view.into()])?;
+            self.add_anchor_constraint(new_view, "leadingAnchor", stack, "leadingAnchor", 0.0)?;
+            self.add_anchor_constraint(new_view, "topAnchor", stack, "topAnchor", 0.0)?;
+            self.add_anchor_constraint(new_view, "trailingAnchor", stack, "trailingAnchor", 0.0)?;
+            self.add_anchor_constraint(new_view, "bottomAnchor", stack, "bottomAnchor", 0.0)?;
             self.builder
                 .build_unconditional_branch(layout_block)
                 .map_err(|error| error.to_string())?;
             self.builder.position_at_end(layout_block);
-            self.send_msg_void(stack, "layoutIfNeeded", &[])?;
+            let layout_selector = if self.is_mac() { "layoutSubtreeIfNeeded" } else { "layoutIfNeeded" };
+            self.send_msg_void(stack, layout_selector, &[])?;
 
             let stored_state = self
                 .builder
@@ -3254,7 +3770,171 @@ impl<'ctx> IosCodeGen<'ctx> {
     }
 
     /// 生成显示窗口的 IR 逻辑
+    /// macOS：NSWindow + contentView，根视图直接约束到内容视图四边。
+    fn build_mac_window_logic(&self, root_node: Option<&IRNode>) -> Result<(), String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let window_class = self.get_class("NSWindow")?;
+        let alloc = self
+            .send_msg_ptr(window_class, self.get_selector("alloc")?, &[])?
+            .ok_or("NSWindow alloc returned void")?;
+        let window = self
+            .send_msg_ptr(
+                alloc,
+                self.get_selector("initWithContentRect:styleMask:backing:defer:")?,
+                &[
+                    self.rect_constant(0.0, 0.0, 420.0, 900.0).into(),
+                    // titled | closable | miniaturizable | resizable
+                    self.context.i64_type().const_int(15, false).into(),
+                    // buffered
+                    self.context.i64_type().const_int(2, false).into(),
+                    self.context.bool_type().const_int(0, false).into(),
+                ],
+            )?
+            .ok_or("NSWindow init returned void")?;
+        if let Some(global) = self.module.get_global("g_window") {
+            self.builder
+                .build_store(global.as_pointer_value(), window)
+                .map_err(|e| e.to_string())?;
+        }
+        let title = self.create_nsstring("Lumen")?;
+        self.send_msg_void(window, "setTitle:", &[title.into()])?;
+
+        let content_view = self
+            .send_msg_ptr(window, self.get_selector("contentView")?, &[])?
+            .ok_or("NSWindow contentView returned void")?;
+        let root_view = if let Some(node) = root_node {
+            let global_view = self
+                .module
+                .get_global("g_root_view")
+                .ok_or("root view global was not created")?;
+            let view = self
+                .builder
+                .build_load(ptr_type, global_view.as_pointer_value(), "mac_root_view")
+                .map_err(|e| e.to_string())?
+                .into_pointer_value();
+            self.send_msg_void(content_view, "addSubview:", &[view.into()])?;
+            self.send_msg_void(
+                view,
+                "setTranslatesAutoresizingMaskIntoConstraints:",
+                &[self.context.bool_type().const_int(0, false).into()],
+            )?;
+            self.constrain_root_view(view, content_view, Some(node_style(node)))?;
+            Some(view)
+        } else {
+            None
+        };
+        if let (Some(view), Some(node)) = (root_view, root_node) {
+            if let Some(target) = find_top_background_view(std::slice::from_ref(node)) {
+                self.install_top_background_extension(view, node_style(target))?;
+            }
+        }
+
+        self.send_msg_void(window, "makeKeyAndOrderFront:", &[ptr_type.const_null().into()])?;
+        let app = self
+            .send_msg_ptr(
+                self.get_class("NSApplication")?,
+                self.get_selector("sharedApplication")?,
+                &[],
+            )?
+            .ok_or("NSApplication sharedApplication returned void")?;
+        self.send_msg_void(
+            app,
+            "activateIgnoringOtherApps:",
+            &[self.context.bool_type().const_int(1, false).into()],
+        )?;
+        Ok(())
+    }
+
+    /// 运行时注册一个 isFlipped 返回 YES 的 NSView 子类，供滚动文档视图使用。
+    fn register_flipped_view_class(&self) -> Result<(), String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let allocate_type = ptr_type.fn_type(
+            &[ptr_type.into(), ptr_type.into(), self.context.i64_type().into()],
+            false,
+        );
+        let allocate = self
+            .module
+            .get_function("objc_allocateClassPair")
+            .unwrap_or_else(|| self.module.add_function("objc_allocateClassPair", allocate_type, None));
+        let add_method_type = self.context.bool_type().fn_type(
+            &[ptr_type.into(), ptr_type.into(), ptr_type.into(), ptr_type.into()],
+            false,
+        );
+        let add_method = self
+            .module
+            .get_function("class_addMethod")
+            .unwrap_or_else(|| self.module.add_function("class_addMethod", add_method_type, None));
+        let register_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
+        let register = self
+            .module
+            .get_function("objc_registerClassPair")
+            .unwrap_or_else(|| self.module.add_function("objc_registerClassPair", register_type, None));
+
+        let is_flipped_type = self
+            .context
+            .i8_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into()], false);
+        let is_flipped = self
+            .module
+            .add_function("lumen_view_is_flipped", is_flipped_type, None);
+        let saved = self.builder.get_insert_block().unwrap();
+        let entry = self.context.append_basic_block(is_flipped, "entry");
+        self.builder.position_at_end(entry);
+        self.builder
+            .build_return(Some(&self.context.i8_type().const_int(1, false)))
+            .map_err(|e| e.to_string())?;
+        self.builder.position_at_end(saved);
+
+        let superclass = self.get_class("NSView")?;
+        let name = self
+            .builder
+            .build_global_string_ptr("LumenFlippedView", "flipped_class_name")
+            .map_err(|e| e.to_string())?;
+        let class_call = self
+            .builder
+            .build_call(
+                allocate,
+                &[
+                    superclass.into(),
+                    name.as_pointer_value().into(),
+                    self.context.i64_type().const_int(0, false).into(),
+                ],
+                "flipped_class",
+            )
+            .map_err(|e| e.to_string())?;
+        let class = match class_call.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(value) => value.into_pointer_value(),
+            inkwell::values::ValueKind::Instruction(_) => {
+                return Err("objc_allocateClassPair returned void".into());
+            }
+        };
+        let selector = self.get_selector("isFlipped")?;
+        let encoding = self
+            .builder
+            .build_global_string_ptr("c@:", "flipped_encoding")
+            .map_err(|e| e.to_string())?;
+        self.builder
+            .build_call(
+                add_method,
+                &[
+                    class.into(),
+                    selector.into(),
+                    is_flipped.as_global_value().as_pointer_value().into(),
+                    encoding.as_pointer_value().into(),
+                ],
+                "",
+            )
+            .map_err(|e| e.to_string())?;
+        self.builder
+            .build_call(register, &[class.into()], "")
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn build_show_window_logic(&self, root_node: Option<&IRNode>) -> Result<(), String> {
+        if self.is_mac() {
+            return self.build_mac_window_logic(root_node);
+        }
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
         // Use the physical screen bounds for both the window and its root view.
@@ -3319,7 +3999,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             )
             .map_err(|error| error.to_string())?
             .into_pointer_value();
-        let background = self.create_objc_instance("UIView")?;
+        let background = self.create_objc_instance(self.view_class())?;
         let color = self.ui_color(
             target_style
                 .background_color
@@ -3574,6 +4254,32 @@ impl<'ctx> IosCodeGen<'ctx> {
         self.activate_constraint(constraint)
     }
 
+    /// 父视图的安全区布局参考，编译期坐标以它为原点。
+    fn safe_area_guide(&self, view: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, String> {
+        self.send_msg_ptr(view, self.get_selector("safeAreaLayoutGuide")?, &[])?
+            .ok_or_else(|| "UIView safeAreaLayoutGuide returned void".into())
+    }
+
+    /// 竖向 flow 锚点。只有「布局盒就是安全区」的容器（根视图，或声明了
+    /// `ignoresSafeArea: "top"` 的容器）才锚到父视图的安全区——它们盖住了状态栏，
+    /// 内容必须让开。其余容器用自己的 bounds：底部这种贴着 home indicator 的容器
+    /// 如果按安全区算，内容会被往上顶半个 bottom inset。
+    fn vertical_flow_target(
+        &self,
+        parent: PointerValue<'ctx>,
+        anchor_name: &'static str,
+        safe_area_box: bool,
+        child_style: &InlineStyle,
+    ) -> Result<(PointerValue<'ctx>, &'static str), String> {
+        let vertical = matches!(anchor_name, "topAnchor" | "bottomAnchor" | "centerYAnchor");
+        let hugs_physical_top = anchor_name == "topAnchor" && child_style.ignores_safe_area_top;
+        // macOS 的 safeAreaLayoutGuide 在视图入窗之前可能是 nil，窗口内容区本身也没有额外 inset
+        if !vertical || !safe_area_box || hugs_physical_top || self.is_mac() {
+            return Ok((parent, anchor_name));
+        }
+        Ok((self.safe_area_guide(parent)?, anchor_name))
+    }
+
     fn add_dimension_constraint(
         &self,
         view: PointerValue<'ctx>,
@@ -3600,8 +4306,14 @@ impl<'ctx> IosCodeGen<'ctx> {
         parent: PointerValue<'ctx>,
         parent_anchor_name: &str,
         fraction: f64,
-        padding: f64,
+        padding: Padding,
     ) -> Result<(), String> {
+        // 百分比按内容区算，先扣掉容器两侧的 padding
+        let inset = if anchor_name == "widthAnchor" {
+            padding.horizontal()
+        } else {
+            padding.vertical()
+        };
         let view_anchor = self
             .send_msg_ptr(view, self.get_selector(anchor_name)?, &[])?
             .ok_or_else(|| format!("{anchor_name} returned void"))?;
@@ -3617,7 +4329,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                     self.context.f64_type().const_float(fraction).into(),
                     self.context
                         .f64_type()
-                        .const_float(-2.0 * padding * fraction)
+                        .const_float(-inset * fraction)
                         .into(),
                 ],
             )?
@@ -3633,7 +4345,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         parent: PointerValue<'ctx>,
         parent_anchor_name: &str,
         size: f64,
-        padding: f64,
+        padding: Padding,
     ) -> Result<(), String> {
         match dimension {
             Some(Dimension::Percent(fraction)) => self.add_percentage_dimension_constraint(
@@ -3656,7 +4368,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         child: PointerValue<'ctx>,
         child_node: &IRNode,
         layout: ChildLayout,
-        padding: f64,
+        padding: Padding,
     ) -> Result<(), String> {
         let Some(Dimension::Percent(fraction)) = node_style(child_node).width else {
             return Ok(());
@@ -3739,7 +4451,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         child: PointerValue<'ctx>,
         child_node: &IRNode,
         layout: ChildLayout,
-        padding: f64,
+        padding: Padding,
         parent_width: f64,
         parent_height: f64,
         position: Position,
@@ -3786,14 +4498,14 @@ impl<'ctx> IosCodeGen<'ctx> {
                     "leadingAnchor",
                     parent,
                     "leadingAnchor",
-                    padding + left + margins.left,
+                    padding.left + left + margins.left,
                 )?;
                 self.add_anchor_constraint(
                     child,
                     "trailingAnchor",
                     parent,
                     "trailingAnchor",
-                    -padding - right - margins.right,
+                    -padding.right - right - margins.right,
                 )?;
             }
             (Some(left), None) => self.add_anchor_constraint(
@@ -3801,14 +4513,14 @@ impl<'ctx> IosCodeGen<'ctx> {
                 "leadingAnchor",
                 parent,
                 "leadingAnchor",
-                padding + left + margins.left,
+                padding.left + left + margins.left,
             )?,
             (None, Some(right)) => self.add_anchor_constraint(
                 child,
                 "trailingAnchor",
                 parent,
                 "trailingAnchor",
-                -padding - right - margins.right,
+                -padding.right - right - margins.right,
             )?,
             (None, None) => self.add_anchor_constraint(
                 child,
@@ -3829,14 +4541,14 @@ impl<'ctx> IosCodeGen<'ctx> {
                     "topAnchor",
                     parent,
                     "topAnchor",
-                    padding + top + margins.top,
+                    padding.top + top + margins.top,
                 )?;
                 self.add_anchor_constraint(
                     child,
                     "bottomAnchor",
                     parent,
                     "bottomAnchor",
-                    -padding - bottom - margins.bottom,
+                    -padding.bottom - bottom - margins.bottom,
                 )?;
             }
             (Some(top), None) => self.add_anchor_constraint(
@@ -3844,14 +4556,14 @@ impl<'ctx> IosCodeGen<'ctx> {
                 "topAnchor",
                 parent,
                 "topAnchor",
-                padding + top + margins.top,
+                padding.top + top + margins.top,
             )?,
             (None, Some(bottom)) => self.add_anchor_constraint(
                 child,
                 "bottomAnchor",
                 parent,
                 "bottomAnchor",
-                -padding - bottom - margins.bottom,
+                -padding.bottom - bottom - margins.bottom,
             )?,
             (None, None) => self.add_anchor_constraint(
                 child,
@@ -3875,9 +4587,16 @@ impl<'ctx> IosCodeGen<'ctx> {
         default_gap: f64,
         width: f64,
         height: f64,
+        safe_area_box: bool,
     ) -> Result<(), String> {
         let direction = style.flex_direction.unwrap_or(default_direction);
-        let padding = style.padding.unwrap_or(0.0);
+        let vertical_flow = direction == FlexDirection::Column;
+        let padding = node_padding(style);
+        // 主轴 / 交叉轴两端的盒内边距
+        let (main_start_inset, main_end_inset, cross_start_inset, cross_end_inset) = match direction {
+            FlexDirection::Row => (padding.left, padding.right, padding.top, padding.bottom),
+            FlexDirection::Column => (padding.top, padding.bottom, padding.left, padding.right),
+        };
         let gap = style.spacing.unwrap_or(default_gap);
         let (main_start, main_end, main_center, cross_start, cross_end, cross_center) =
             match direction {
@@ -3921,9 +4640,9 @@ impl<'ctx> IosCodeGen<'ctx> {
             + main_margins_total
             + gap * flow_indices.len().saturating_sub(1) as f64;
         let main_extent = if direction == FlexDirection::Row {
-            width - 2.0 * padding
+            width - padding.horizontal()
         } else {
-            height - 2.0 * padding
+            height - padding.vertical()
         };
         let free_space = (main_extent - used_main).max(0.0);
         let justify = style.justify_content.unwrap_or(JustifyContent::Start);
@@ -3935,6 +4654,9 @@ impl<'ctx> IosCodeGen<'ctx> {
             .map(|((child, node), layout)| (child, node, layout))
             .enumerate()
         {
+            if child.is_null() {
+                continue;
+            }
             if node_style(child_node).position == Position::Absolute
                 || node_style(child_node).left.is_some()
                 || node_style(child_node).right.is_some()
@@ -3958,6 +4680,16 @@ impl<'ctx> IosCodeGen<'ctx> {
                 .position(|&flow_index| flow_index == index)
                 .expect("relative child belongs to flex flow");
             let margins = node_margins(child_node);
+            let (flow_start_parent, flow_start_anchor_name) = if vertical_flow {
+                self.vertical_flow_target(
+                    parent,
+                    main_start,
+                    safe_area_box,
+                    node_style(child_node),
+                )?
+            } else {
+                (parent, main_start)
+            };
             let (main_margin_start, main_margin_end, cross_margin_start, cross_margin_end) =
                 match direction {
                     FlexDirection::Row => (margins.left, margins.right, margins.top, margins.bottom),
@@ -3974,7 +4706,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                 (FlexDirection::Row, Some(ImageMode::HeightFix))
                     | (FlexDirection::Column, Some(ImageMode::WidthFix))
             );
-            if !main_axis_auto {
+            let self_sized = matches!(child_node, IRNode::Conditional { .. });
+            if !main_axis_auto && !(self_sized && vertical_flow) {
                 let (dimension, child_anchor, parent_anchor) = match direction {
                     FlexDirection::Row => (
                         node_style(child_node).width,
@@ -3988,7 +4721,36 @@ impl<'ctx> IosCodeGen<'ctx> {
                     ),
                 };
                 let vertical = direction == FlexDirection::Column;
-                if !node_uses_intrinsic_dimension(child_node, vertical) {
+                if vertical && node_style(child_node).ignores_safe_area_top {
+                    // 上边缘越过安全区，下边缘留在排版位置，高度由安全区高度撑开
+                    let bottom_target = if safe_area_box && !self.is_mac() {
+                        self.safe_area_guide(parent)?
+                    } else {
+                        parent
+                    };
+                    self.add_anchor_constraint(
+                        *child,
+                        main_end,
+                        bottom_target,
+                        "topAnchor",
+                        layout.y + main_sizes[index],
+                    )?;
+                } else if vertical
+                    && node_style(child_node).flex_grow > 0.0
+                    && node_style(child_node).height.is_none()
+                    && flow_position + 1 == flow_indices.len()
+                {
+                    // 容器高度只有运行时才知道，grow 的尾节点改撑满剩余空间
+                    self.add_anchor_constraint(
+                        *child,
+                        main_end,
+                        parent,
+                        main_end,
+                        -main_end_inset - main_margin_end,
+                    )?;
+                } else if !node_uses_intrinsic_dimension(child_node, vertical)
+                    || (self_sized && !vertical)
+                {
                     self.add_flex_dimension_constraint(
                         *child,
                         dimension,
@@ -4015,20 +4777,32 @@ impl<'ctx> IosCodeGen<'ctx> {
             );
             let cross_is_stretched =
                 align == AlignItems::Stretch && explicit_cross.is_none() && !cross_axis_auto;
+            let (cross_start_target, cross_start_anchor) = self.vertical_flow_target(
+                parent,
+                cross_start,
+                safe_area_box,
+                node_style(child_node),
+            )?;
+            let (cross_end_target, cross_end_anchor) = self.vertical_flow_target(
+                parent,
+                cross_end,
+                safe_area_box,
+                node_style(child_node),
+            )?;
             if cross_is_stretched {
                 self.add_anchor_constraint(
                     *child,
                     cross_start,
-                    parent,
-                    cross_start,
-                    padding + cross_margin_start,
+                    cross_start_target,
+                    cross_start_anchor,
+                    cross_start_inset + cross_margin_start,
                 )?;
                 self.add_anchor_constraint(
                     *child,
                     cross_end,
-                    parent,
-                    cross_end,
-                    -padding - cross_margin_end,
+                    cross_end_target,
+                    cross_end_anchor,
+                    -cross_end_inset - cross_margin_end,
                 )?;
             } else {
                 let vertical = direction == FlexDirection::Row;
@@ -4063,27 +4837,33 @@ impl<'ctx> IosCodeGen<'ctx> {
                             FlexDirection::Row => (layout.y, height, layout.height),
                             FlexDirection::Column => (layout.x, width, layout.width),
                         };
+                        let (center_target, center_anchor) = self.vertical_flow_target(
+                            parent,
+                            cross_center,
+                            safe_area_box,
+                            node_style(child_node),
+                        )?;
                         self.add_anchor_constraint(
                             *child,
                             cross_center,
-                            parent,
-                            cross_center,
+                            center_target,
+                            center_anchor,
                             position + child_size / 2.0 - container_size / 2.0,
                         )?;
                     }
                     AlignItems::End => self.add_anchor_constraint(
                         *child,
                         cross_end,
-                        parent,
-                        cross_end,
-                        -padding - cross_margin_end,
+                        cross_end_target,
+                        cross_end_anchor,
+                        -cross_end_inset - cross_margin_end,
                     )?,
                     AlignItems::Start | AlignItems::Stretch => self.add_anchor_constraint(
                         *child,
                         cross_start,
-                        parent,
-                        cross_start,
-                        padding + cross_margin_start,
+                        cross_start_target,
+                        cross_start_anchor,
+                        cross_start_inset + cross_margin_start,
                     )?,
                 }
             }
@@ -4103,9 +4883,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                         self.add_anchor_constraint(
                             *child,
                             main_start,
-                            parent,
-                            main_start,
-                            padding + main_margin_start,
+                            flow_start_parent,
+                            flow_start_anchor_name,
+                            main_start_inset + main_margin_start,
                         )?;
                     } else {
                         let previous_index = flow_indices[flow_position - 1];
@@ -4130,7 +4910,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                             main_end,
                             parent,
                             main_end,
-                            -padding - main_margin_end,
+                            -main_end_inset - main_margin_end,
                         )?;
                     } else {
                         let next_index = flow_indices[flow_position + 1];
@@ -4174,9 +4954,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                         self.add_anchor_constraint(
                             *child,
                             main_start,
-                            parent,
-                            main_start,
-                            padding + main_margin_start,
+                            flow_start_parent,
+                            flow_start_anchor_name,
+                            main_start_inset + main_margin_start,
                         )?;
                     } else if flow_position + 1 == flow_indices.len() {
                         self.add_anchor_constraint(
@@ -4184,7 +4964,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                             main_end,
                             parent,
                             main_end,
-                            -padding - main_margin_end,
+                            -main_end_inset - main_margin_end,
                         )?;
                     } else {
                         let distributed_gap = gap + free_space / flow_indices.len().saturating_sub(1).max(1) as f64;
@@ -4223,6 +5003,42 @@ impl<'ctx> IosCodeGen<'ctx> {
         direction: FlexDirection,
         default_gap: f64,
     ) -> Result<PointerValue<'ctx>, String> {
+        if self.is_mac() {
+            // NSStackView 用 orientation/alignment/spacing 表达；alignment 取 NSLayoutAttribute
+            let vertical = direction == FlexDirection::Column;
+            self.send_msg_void(
+                stack,
+                "setOrientation:",
+                &[self.context.i64_type().const_int(u64::from(vertical), false).into()],
+            )?;
+            let alignment = match (vertical, style.align_items.unwrap_or(AlignItems::Stretch)) {
+                // 竖向栈：leading / centerX / trailing / width
+                (true, AlignItems::Start) => 5,
+                (true, AlignItems::Center) => 9,
+                (true, AlignItems::End) => 6,
+                (true, AlignItems::Stretch) => 7,
+                // 横向栈：top / centerY / bottom / height
+                (false, AlignItems::Start) => 3,
+                (false, AlignItems::Center) => 10,
+                (false, AlignItems::End) => 4,
+                (false, AlignItems::Stretch) => 8,
+            };
+            self.send_msg_void(
+                stack,
+                "setAlignment:",
+                &[self.context.i64_type().const_int(alignment, false).into()],
+            )?;
+            self.send_msg_void(
+                stack,
+                "setSpacing:",
+                &[self
+                    .context
+                    .f64_type()
+                    .const_float(style.spacing.unwrap_or(default_gap))
+                    .into()],
+            )?;
+            return Ok(stack);
+        }
         self.send_msg_void(
             stack,
             "setAxis:",
@@ -4264,16 +5080,12 @@ impl<'ctx> IosCodeGen<'ctx> {
             "setLayoutMarginsRelativeArrangement:",
             &[self.context.i8_type().const_int(1, false).into()],
         )?;
-        let padding = style.padding.unwrap_or(0.0);
-        let scalar = self.context.f64_type();
-        let insets = self.context.const_struct(
-            &[
-                scalar.const_float(padding).into(),
-                scalar.const_float(padding).into(),
-                scalar.const_float(padding).into(),
-                scalar.const_float(padding).into(),
-            ],
-            false,
+        let padding = node_padding(style);
+        let insets = self.ui_edge_insets(
+            padding.top,
+            padding.left,
+            padding.bottom,
+            padding.right,
         );
         self.send_msg_void(stack, "setLayoutMargins:", &[insets.into()])?;
         Ok(stack)
@@ -4289,16 +5101,11 @@ impl<'ctx> IosCodeGen<'ctx> {
         default_direction: FlexDirection,
         default_gap: f64,
         event_target: Option<PointerValue<'ctx>>,
+        safe_area_box: bool,
+        size_to_content: bool,
     ) -> Result<(), String> {
-        let direction = style.flex_direction.unwrap_or(default_direction);
-        let padding = style.padding.unwrap_or(0.0);
-        let stack = parent;
-        self.configure_conditional_stack(
-            stack,
-            style,
-            direction,
-            default_gap,
-        )?;
+        // 含条件子级的容器同样是普通视图：位置和尺寸全部由约束决定
+        let padding = node_padding(style);
         let layouts = layout_flex_children(
             children,
             style,
@@ -4307,125 +5114,175 @@ impl<'ctx> IosCodeGen<'ctx> {
             default_direction,
             default_gap,
         );
-        let mut absolute_nodes = Vec::new();
-        let mut absolute_views = Vec::new();
-        let mut absolute_layouts = Vec::new();
-        for (index, (child, layout)) in children.iter().zip(&layouts).enumerate() {
+        let mut child_views: Vec<PointerValue<'ctx>> = Vec::with_capacity(children.len());
+        for (child, layout) in children.iter().zip(&layouts) {
             let child_view = self.codegen_node(
                 child,
                 event_target,
                 0.0,
                 0.0,
-                (width - 2.0 * padding).max(0.0),
-                (height - 2.0 * padding).max(0.0),
+                (width - padding.horizontal()).max(0.0),
+                (height - padding.vertical()).max(0.0),
                 Some(*layout),
                 false,
             )?;
-            if node_style(child).position == Position::Absolute {
-                self.send_msg_void(parent, "addSubview:", &[child_view.into()])?;
-                absolute_nodes.push(child.clone());
-                absolute_views.push(child_view);
-                absolute_layouts.push(*layout);
-                continue;
-            }
-            if let IRNode::Conditional { .. } = child {
-                let runtime_index = self
-                    .conditional_instances
-                    .borrow()
-                    .len()
-                    .checked_sub(1)
-                    .ok_or("conditional runtime metadata was not generated")?;
-                let mut instances = self.conditional_instances.borrow_mut();
-                let runtime = &mut instances[runtime_index];
-                runtime.true_index = conditional_arranged_index(children, index, true);
-                runtime.false_index = conditional_arranged_index(children, index, false);
-                self.builder
-                    .build_store(runtime.stack.as_pointer_value(), stack)
-                    .map_err(|error| error.to_string())?;
-                let runtime = runtime.clone();
-                drop(instances);
-                let ptr_type = self.context.ptr_type(AddressSpace::default());
-                let true_view = self.builder
-                    .build_load(ptr_type, runtime.true_view.as_pointer_value(), "conditional_true_for_layout")
-                    .map_err(|error| error.to_string())?
-                    .into_pointer_value();
-                let false_view = self.builder
-                    .build_load(ptr_type, runtime.false_view.as_pointer_value(), "conditional_false_for_layout")
-                    .map_err(|error| error.to_string())?
-                    .into_pointer_value();
-                self.send_msg_void(stack, "addSubview:", &[true_view.into()])?;
-                if !false_view.is_null() {
-                    self.send_msg_void(stack, "addSubview:", &[false_view.into()])?;
-                }
-                if let IRNode::Conditional { initial, .. } = child {
-                    self.send_msg_void(
-                        true_view,
-                        "setHidden:",
-                        &[self.context.i8_type().const_int(u64::from(!initial), false).into()],
-                    )?;
-                    if !false_view.is_null() {
-                        self.send_msg_void(
-                            false_view,
-                            "setHidden:",
-                            &[self.context.i8_type().const_int(u64::from(*initial), false).into()],
-                        )?;
-                    }
-                }
-                if !child_view.is_null() {
-                    self.send_msg_void(stack, "addArrangedSubview:", &[child_view.into()])?;
-                }
-                if let IRNode::Conditional { when_true, when_false, .. } = child {
-                    self.constrain_dynamic_child(
-                        stack,
-                        true_view,
-                        when_true,
-                        *layout,
-                        padding,
-                        direction,
-                    )?;
-                    if let Some(when_false) = when_false {
-                        self.constrain_dynamic_child(
-                            stack,
-                            false_view,
-                            when_false,
-                            *layout,
-                            padding,
-                            direction,
-                        )?;
-                    }
-                }
-            }
             if !child_view.is_null() {
-                self.send_msg_void(
-                    child_view,
-                    "setTranslatesAutoresizingMaskIntoConstraints:",
-                    &[self.context.i8_type().const_int(0, false).into()],
-                )?;
-                if !matches!(child, IRNode::Conditional { .. }) {
-                    self.send_msg_void(stack, "addArrangedSubview:", &[child_view.into()])?;
-                    self.constrain_dynamic_child(
-                        stack,
-                        child_view,
-                        child,
-                        *layout,
-                        padding,
-                        direction,
-                    )?;
-                }
+                self.send_msg_void(parent, "addSubview:", &[child_view.into()])?;
             }
+            child_views.push(child_view);
         }
         self.constrain_flex_children(
             parent,
-            &absolute_views,
-            &absolute_nodes,
-            &absolute_layouts,
+            &child_views,
+            children,
+            &layouts,
             style,
             default_direction,
             default_gap,
             width,
             height,
+            safe_area_box,
         )?;
+        if size_to_content {
+            // 滚动内容容器没有固定高度，用最后一个子视图的底边撑出内容尺寸
+            let last_view = children
+                .iter()
+                .zip(&child_views)
+                .filter(|(child, view)| {
+                    node_style(child).position != Position::Absolute && !view.is_null()
+                })
+                .map(|(_, view)| *view)
+                .next_back();
+            if let Some(last_view) = last_view {
+                self.add_anchor_constraint(
+                    parent,
+                    "bottomAnchor",
+                    last_view,
+                    "bottomAnchor",
+                    padding.bottom,
+                )?;
+            }
+        }
         Ok(())
+    }
+
+    /// macOS 的滚动容器：NSScrollView + 一个 isFlipped 的文档视图，
+    /// 内容按约束排进去，高度由最后一个子视图决定。
+    fn codegen_mac_scroll(
+        &self,
+        node: &IRNode,
+        style: &InlineStyle,
+        children: &[IRNode],
+        event_target: Option<PointerValue<'ctx>>,
+        x: f64,
+        y: f64,
+        available_width: f64,
+        available_height: f64,
+        allocated: Option<ChildLayout>,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let width = allocated
+            .map(|layout| layout.width)
+            .unwrap_or_else(|| {
+                style
+                    .width
+                    .map(|dimension| dimension.resolve(available_width))
+                    .unwrap_or_else(|| node_width(node, available_width))
+            });
+        let height = allocated
+            .map(|layout| layout.height)
+            .unwrap_or_else(|| node_height(node, available_height));
+        let scroll_view =
+            self.create_objc_instance_with_frame("NSScrollView", self.rect_constant(x, y, width, height))?;
+        self.apply_inline_style(scroll_view, style, false)?;
+        self.send_msg_void(scroll_view, "setHasVerticalScroller:", &[self.context.i8_type().const_int(1, false).into()])?;
+        self.send_msg_void(scroll_view, "setAutohidesScrollers:", &[self.context.i8_type().const_int(1, false).into()])?;
+        // 卡片背景画在滚动视图自己身上，并让圆角裁剪内部 clip view
+        self.send_msg_void(scroll_view, "setDrawsBackground:", &[self.context.i8_type().const_int(1, false).into()])?;
+        if let Some(color_name) = &style.background_color {
+            let color = self.ui_color(color_name)?;
+            self.send_msg_void(scroll_view, "setBackgroundColor:", &[color.into()])?;
+        }
+        if style.border_radius.is_some() {
+            self.wants_layer(scroll_view)?;
+            let layer = self
+                .send_msg_ptr(scroll_view, self.get_selector("layer")?, &[])?
+                .ok_or("NSScrollView layer returned void")?;
+            self.send_msg_void(layer, "setMasksToBounds:", &[self.context.i8_type().const_int(1, false).into()])?;
+        }
+
+        let document = self.create_objc_instance_with_frame(
+            "LumenFlippedView",
+            self.rect_constant(0.0, 0.0, width, height),
+        )?;
+        self.send_msg_void(
+            document,
+            "setTranslatesAutoresizingMaskIntoConstraints:",
+            &[self.context.i8_type().const_int(0, false).into()],
+        )?;
+        self.send_msg_void(scroll_view, "setDocumentView:", &[document.into()])?;
+        let clip_view = self
+            .send_msg_ptr(scroll_view, self.get_selector("contentView")?, &[])?
+            .ok_or("NSScrollView contentView returned void")?;
+        self.add_anchor_constraint(document, "leadingAnchor", clip_view, "leadingAnchor", 0.0)?;
+        self.add_anchor_constraint(document, "trailingAnchor", clip_view, "trailingAnchor", 0.0)?;
+        self.add_anchor_constraint(document, "topAnchor", clip_view, "topAnchor", 0.0)?;
+
+        let padding = node_padding(style);
+        let layouts = layout_flex_children(
+            children,
+            style,
+            width,
+            height,
+            FlexDirection::Column,
+            0.0,
+        );
+        let mut child_views: Vec<PointerValue<'ctx>> = Vec::with_capacity(children.len());
+        for (child, layout) in children.iter().zip(&layouts) {
+            let child_view = self.codegen_node(
+                child,
+                event_target,
+                0.0,
+                0.0,
+                (width - padding.horizontal()).max(0.0),
+                (height - padding.vertical()).max(0.0),
+                Some(*layout),
+                false,
+            )?;
+            if !child_view.is_null() {
+                self.send_msg_void(document, "addSubview:", &[child_view.into()])?;
+            }
+            child_views.push(child_view);
+        }
+        self.constrain_flex_children(
+            document,
+            &child_views,
+            children,
+            &layouts,
+            style,
+            FlexDirection::Column,
+            0.0,
+            width,
+            height,
+            false,
+        )?;
+        let last_view = children
+            .iter()
+            .zip(&child_views)
+            .filter(|(child, view)| {
+                node_style(child).position != Position::Absolute && !view.is_null()
+            })
+            .map(|(_, view)| *view)
+            .next_back();
+        if let Some(last_view) = last_view {
+            self.add_anchor_constraint(
+                document,
+                "bottomAnchor",
+                last_view,
+                "bottomAnchor",
+                padding.bottom,
+            )?;
+        }
+        Ok(scroll_view)
     }
 
     fn codegen_dynamic_scroll_content(
@@ -4438,15 +5295,8 @@ impl<'ctx> IosCodeGen<'ctx> {
         event_target: Option<PointerValue<'ctx>>,
     ) -> Result<(), String> {
         let frame = self.rect_constant(0.0, 0.0, width, height);
-        let content_stack = self.create_objc_instance_with_frame("UIStackView", frame)?;
-        let mut content_style = style.clone();
-        content_style.flex_direction = Some(FlexDirection::Column);
-        self.configure_conditional_stack(
-            content_stack,
-            &content_style,
-            FlexDirection::Column,
-            0.0,
-        )?;
+        let content_stack = self.create_objc_instance_with_frame(self.view_class(), frame)?;
+        let content_style = style.clone();
         self.send_msg_void(
             content_stack,
             "setTranslatesAutoresizingMaskIntoConstraints:",
@@ -4504,6 +5354,8 @@ impl<'ctx> IosCodeGen<'ctx> {
             FlexDirection::Column,
             0.0,
             event_target,
+            false,
+            true,
         )
     }
 
@@ -4513,9 +5365,10 @@ impl<'ctx> IosCodeGen<'ctx> {
         child_view: PointerValue<'ctx>,
         child: &IRNode,
         layout: ChildLayout,
-        padding: f64,
+        padding: Padding,
         direction: FlexDirection,
     ) -> Result<(), String> {
+        let _ = direction;
         let style = node_style(child);
         let container = matches!(
             child,
@@ -4561,7 +5414,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             }
             None if container
                 && !dynamic_container
-                && !(style.flex_grow > 0.0 && direction == FlexDirection::Column) =>
+                && !(style.flex_grow > 0.0) =>
             {
                 self.add_dimension_constraint(
                     child_view,
@@ -4593,7 +5446,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         let allocated_height = allocated.map(|layout| layout.height);
         match node {
             IRNode::Conditional {
-                state_name: _,
+                cell,
                 style: _,
                 initial,
                 when_true,
@@ -4642,6 +5495,49 @@ impl<'ctx> IosCodeGen<'ctx> {
                         &[self.context.i8_type().const_int(0, false).into()],
                     )?;
                 }
+                // 槽位视图：条件分支都挂在它下面，父级把它当普通 flow 子视图约束
+                let slot_frame = self.rect_constant(
+                    x,
+                    y,
+                    allocated_width.unwrap_or(available_width),
+                    allocated_height.unwrap_or(available_height),
+                );
+                let slot = self.create_objc_instance_with_frame(self.view_class(), slot_frame)?;
+                // 槽位自身的 frame 只是初值，尺寸要靠约束定（行方向给宽度、列方向给高度），
+                // 否则 autoresizing 与锚点约束会打架，分支里的内容会被压成几个像素。
+                self.send_msg_void(
+                    slot,
+                    "setTranslatesAutoresizingMaskIntoConstraints:",
+                    &[self.context.i8_type().const_int(0, false).into()],
+                )?;
+                self.apply_background_color(slot, self.ui_color("clear")?)?;
+                // 只挂载当前可见的分支，另一条先游离；切换时真增删
+                let initial_view = if *initial { true_view } else { false_view };
+                if !initial_view.is_null() {
+                    self.send_msg_void(slot, "addSubview:", &[initial_view.into()])?;
+                    self.add_anchor_constraint(initial_view, "leadingAnchor", slot, "leadingAnchor", 0.0)?;
+                    self.add_anchor_constraint(initial_view, "topAnchor", slot, "topAnchor", 0.0)?;
+                    self.add_anchor_constraint(initial_view, "trailingAnchor", slot, "trailingAnchor", 0.0)?;
+                    self.add_anchor_constraint(initial_view, "bottomAnchor", slot, "bottomAnchor", 0.0)?;
+                }
+                let slot_height = allocated_height
+                    .unwrap_or_else(|| node_height(when_true, available_height));
+                let visible = *initial;
+                let height_constraint = self
+                    .send_msg_ptr(slot, self.get_selector("heightAnchor")?, &[])?
+                    .ok_or("slot heightAnchor returned void")?;
+                let height_constraint = self
+                    .send_msg_ptr(
+                        height_constraint,
+                        self.get_selector("constraintEqualToConstant:")?,
+                        &[self
+                            .context
+                            .f64_type()
+                            .const_float(if visible { slot_height } else { 0.0 })
+                            .into()],
+                    )?
+                    .ok_or("slot height constraint returned void")?;
+                self.activate_constraint(height_constraint)?;
                 let index = self.conditional_counter.get();
                 self.conditional_counter.set(index + 1);
                 let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -4660,9 +5556,21 @@ impl<'ctx> IosCodeGen<'ctx> {
                     None,
                     &format!("g_conditional_stack_{index}"),
                 );
+                let height_global = self.module.add_global(
+                    ptr_type,
+                    None,
+                    &format!("g_conditional_height_{index}"),
+                );
                 true_global.set_initializer(&ptr_type.const_null());
                 false_global.set_initializer(&ptr_type.const_null());
                 stack_global.set_initializer(&ptr_type.const_null());
+                height_global.set_initializer(&ptr_type.const_null());
+                self.builder
+                    .build_store(stack_global.as_pointer_value(), slot)
+                    .map_err(|error| error.to_string())?;
+                self.builder
+                    .build_store(height_global.as_pointer_value(), height_constraint)
+                    .map_err(|error| error.to_string())?;
                 self.builder
                     .build_store(true_global.as_pointer_value(), true_view)
                     .map_err(|error| error.to_string())?;
@@ -4683,22 +5591,19 @@ impl<'ctx> IosCodeGen<'ctx> {
                     )
                     .map_err(|error| error.to_string())?;
                 self.conditional_instances.borrow_mut().push(ConditionalRuntime {
-                    stack: stack_global,
+                    cell: cell.clone(),
+                    slot: stack_global,
                     true_view: true_global,
                     false_view: false_global,
                     active_state: active_global,
-                    true_index: 0,
-                    false_index: 0,
+                    height_constraint: height_global,
+                    slot_height,
                     true_mount: true_mount.clone(),
                     true_unmount: true_unmount.clone(),
                     false_mount: false_mount.clone(),
                     false_unmount: false_unmount.clone(),
                 });
-                if *initial {
-                    Ok(true_view)
-                } else {
-                    Ok(false_view)
-                }
+                Ok(slot)
             }
             IRNode::View { style, children } => {
                 let width = allocated.map(|layout| layout.width).unwrap_or_else(|| {
@@ -4712,18 +5617,18 @@ impl<'ctx> IosCodeGen<'ctx> {
                 } else {
                     self.rect_constant(x, y, width, height)
                 };
-                let dynamic_layout = node_has_conditional(node);
-                let view = self.create_objc_instance_with_frame(
-                    if dynamic_layout { "UIStackView" } else { "UIView" },
-                    view_frame,
-                )?;
+                let dynamic_layout = has_direct_conditional(children);
+                let view = self.create_objc_instance_with_frame(self.view_class(), view_frame)?;
                 self.apply_inline_style(view, style, false)?;
                 self.configure_scroll_fade_target(view, style)?;
-                if style.background_color.is_none() {
+                // 只有根视图需要一个不透明底色（窗口背景是黑的）；其他容器没写 backgroundColor
+                // 时保持透明，否则嵌在有背景色的卡片里会画出一块白。
+                if is_root && style.background_color.is_none() {
                     let white = self.ui_color("white")?;
-                    self.send_msg_void(view, "setBackgroundColor:", &[white.into()])?;
+                    self.apply_background_color(view, white)?;
                 }
-                let padding = style.padding.unwrap_or(0.0);
+                let padding = node_padding(style);
+                let safe_area_box = is_root || style.ignores_safe_area_top;
                 if dynamic_layout {
                     self.codegen_dynamic_children(
                         view,
@@ -4734,6 +5639,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                         FlexDirection::Column,
                         0.0,
                         event_target,
+                        safe_area_box,
+                        false,
                     )?;
                 } else {
                     let layouts = layout_flex_children(
@@ -4751,8 +5658,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                             event_target,
                             0.0,
                             0.0,
-                            (width - 2.0 * padding).max(0.0),
-                            (height - 2.0 * padding).max(0.0),
+                            (width - padding.horizontal()).max(0.0),
+                            (height - padding.vertical()).max(0.0),
                             Some(*layout),
                             false,
                         )?;
@@ -4769,6 +5676,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                         0.0,
                         width,
                         height,
+                        is_root || style.ignores_safe_area_top,
                     )?;
                 }
                 Ok(view)
@@ -4781,14 +5689,12 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let height = allocated.map(|layout| layout.height)
                     .unwrap_or_else(|| node_height(node, available_height));
                 let frame = self.rect_constant(x, y, width, height);
-                let dynamic_layout = node_has_conditional(node);
-                let stack = self.create_objc_instance_with_frame(
-                    if dynamic_layout { "UIStackView" } else { "UIView" },
-                    frame,
-                )?;
+                let dynamic_layout = has_direct_conditional(children);
+                let stack = self.create_objc_instance_with_frame(self.view_class(), frame)?;
                 self.apply_inline_style(stack, style, false)?;
                 self.configure_scroll_fade_target(stack, style)?;
-                let padding = style.padding.unwrap_or(0.0);
+                let padding = node_padding(style);
+                let safe_area_box = is_root || style.ignores_safe_area_top;
                 if dynamic_layout {
                     self.codegen_dynamic_children(
                         stack,
@@ -4799,6 +5705,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                         FlexDirection::Column,
                         8.0,
                         event_target,
+                        safe_area_box,
+                        false,
                     )?;
                 } else {
                     let layouts = layout_flex_children(
@@ -4816,8 +5724,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                             event_target,
                             0.0,
                             0.0,
-                            (width - 2.0 * padding).max(0.0),
-                            (height - 2.0 * padding).max(0.0),
+                            (width - padding.horizontal()).max(0.0),
+                            (height - padding.vertical()).max(0.0),
                             Some(*layout),
                             false,
                         )?;
@@ -4834,11 +5742,25 @@ impl<'ctx> IosCodeGen<'ctx> {
                         8.0,
                         width,
                         height,
+                        is_root || style.ignores_safe_area_top,
                     )?;
                 }
                 Ok(stack)
             }
             IRNode::ScrollView { style, children } => {
+                if self.is_mac() {
+                    return self.codegen_mac_scroll(
+                        node,
+                        style,
+                        children,
+                        event_target,
+                        x,
+                        y,
+                        available_width,
+                        available_height,
+                        allocated,
+                    );
+                }
                 let width = allocated.map(|layout| layout.width).unwrap_or_else(|| {
                     style.width.map(|dimension| dimension.resolve(available_width))
                         .unwrap_or_else(|| node_width(node, available_width))
@@ -4846,7 +5768,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let height = allocated.map(|layout| layout.height)
                     .unwrap_or_else(|| node_height(node, available_height));
                 let frame = self.rect_constant(x, y, width, height);
-                let scroll_view = self.create_objc_instance_with_frame("UIScrollView", frame)?;
+                let scroll_view = self.create_objc_instance_with_frame(self.scroll_class(), frame)?;
                 self.apply_inline_style(scroll_view, style, false)?;
                 if style.scroll_fade_target.is_some() {
                     let target = event_target.ok_or("ScrollView fadeTarget requires an event target")?;
@@ -4859,11 +5781,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                         .build_store(scroll_global.as_pointer_value(), scroll_view)
                         .map_err(|error| error.to_string())?;
                 }
-                if style.background_color.is_none() {
-                    let white = self.ui_color("white")?;
-                    self.send_msg_void(scroll_view, "setBackgroundColor:", &[white.into()])?;
-                }
-                if node_has_conditional(node) {
+                // 滚动容器也不再默认涂白：没写 backgroundColor 就和 UIKit 一样透明。
+                if has_direct_conditional(children) {
                     self.codegen_dynamic_scroll_content(
                         scroll_view,
                         children,
@@ -4874,7 +5793,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                     )?;
                     return Ok(scroll_view);
                 }
-                let padding = style.padding.unwrap_or(0.0);
+                let padding = node_padding(style);
                 let child_layouts = layout_flex_children(
                     children,
                     style,
@@ -4891,8 +5810,8 @@ impl<'ctx> IosCodeGen<'ctx> {
                         event_target,
                         0.0,
                         0.0,
-                        (width - 2.0 * padding).max(0.0),
-                        (height - 2.0 * padding).max(0.0),
+                        (width - padding.horizontal()).max(0.0),
+                        (height - padding.vertical()).max(0.0),
                         Some(*layout),
                         false,
                     )?;
@@ -4919,41 +5838,48 @@ impl<'ctx> IosCodeGen<'ctx> {
                 Ok(scroll_view)
             }
             IRNode::Text { content, style } => {
-                let label =
-                    self.create_objc_instance_with_frame(
-                        "UILabel",
-                        self.rect_constant(
-                            x,
-                            y,
-                            allocated_width.unwrap_or_else(|| {
-                                style.width.map(|dimension| dimension.resolve(available_width))
-                                    .unwrap_or(available_width)
-                            }),
-                            allocated_height.unwrap_or_else(|| node_height(node, available_height)),
-                        ),
-                    )?;
+                let frame = self.rect_constant(
+                    x,
+                    y,
+                    allocated_width.unwrap_or_else(|| {
+                        style.width.map(|dimension| dimension.resolve(available_width))
+                            .unwrap_or(available_width)
+                    }),
+                    allocated_height.unwrap_or_else(|| node_height(node, available_height)),
+                );
+                let label = self.create_objc_instance_with_frame(self.label_class(), frame)?;
+                self.configure_label(label)?;
                 let nsstring = self.create_nsstring(content)?;
-                self.send_msg_void(label, "setText:", &[nsstring.into()])?;
-                self.apply_inline_style(label, style, true)?;
-                Ok(label)
+                self.set_label_text(label, nsstring)?;
+                let padding = node_padding(style);
+                if padding.is_zero() {
+                    self.apply_inline_style(label, style, true)?;
+                    Ok(label)
+                } else {
+                    self.apply_text_style(label, style)?;
+                    self.wrap_padded_leaf(label, style, frame, padding)
+                }
             }
-            IRNode::StateText { initial, style } => {
-                let label =
-                    self.create_objc_instance_with_frame(
-                        "UILabel",
-                        self.rect_constant(
-                            x,
-                            y,
-                            allocated_width.unwrap_or_else(|| {
-                                style.width.map(|dimension| dimension.resolve(available_width))
-                                    .unwrap_or(available_width)
-                            }),
-                            allocated_height.unwrap_or_else(|| node_height(node, available_height)),
-                        ),
-                    )?;
+            IRNode::StateText { cell, initial, style } => {
+                let frame = self.rect_constant(
+                    x,
+                    y,
+                    allocated_width.unwrap_or_else(|| {
+                        style.width.map(|dimension| dimension.resolve(available_width))
+                            .unwrap_or(available_width)
+                    }),
+                    allocated_height.unwrap_or_else(|| node_height(node, available_height)),
+                );
+                let label = self.create_objc_instance_with_frame(self.label_class(), frame)?;
+                self.configure_label(label)?;
                 let nsstring = self.create_nsstring(&initial.display_value())?;
-                self.send_msg_void(label, "setText:", &[nsstring.into()])?;
-                self.apply_inline_style(label, style, true)?;
+                self.set_label_text(label, nsstring)?;
+                let padding = node_padding(style);
+                if padding.is_zero() {
+                    self.apply_inline_style(label, style, true)?;
+                } else {
+                    self.apply_text_style(label, style)?;
+                }
                 let label_index = self.state_label_counter.get();
                 self.state_label_counter.set(label_index + 1);
                 let state_label = self.module.add_global(
@@ -4967,7 +5893,11 @@ impl<'ctx> IosCodeGen<'ctx> {
                 self.builder
                     .build_store(state_label.as_pointer_value(), label)
                     .map_err(|e| e.to_string())?;
-                self.state_label_globals.borrow_mut().push(state_label);
+                self.state_label_globals
+                    .borrow_mut()
+                    .entry(cell.clone())
+                    .or_default()
+                    .push(state_label);
                 Ok(label)
             }
             IRNode::Image { source, mode, style } => {
@@ -4975,12 +5905,12 @@ impl<'ctx> IosCodeGen<'ctx> {
                     return Err("Image requires a non-empty src or source asset name".into());
                 }
                 let image_name = self.create_nsstring(source)?;
-                let image_class = self.get_class("UIImage")?;
+                let image_class = self.get_class(if self.is_mac() { "NSImage" } else { "UIImage" })?;
                 let image_named = self.get_selector("imageNamed:")?;
                 let image = self
                     .send_msg_ptr(image_class, image_named, &[image_name.into()])?
                     .ok_or("UIImage imageNamed: returned void")?;
-                let image_view_class = self.get_class("UIImageView")?;
+                let image_view_class = self.get_class(self.image_view_class())?;
                 let alloc = self.get_selector("alloc")?;
                 let image_view = self
                     .send_msg_ptr(image_view_class, alloc, &[])?
@@ -4989,33 +5919,37 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let image_view = self
                     .send_msg_ptr(image_view, init_with_image, &[image.into()])?
                     .ok_or("UIImageView initWithImage: returned void")?;
-                self.send_msg_void(
-                    image_view,
-                    "setFrame:",
-                    &[self.rect_constant(
-                        x,
-                        y,
-                        allocated_width.unwrap_or_else(|| {
-                            style.width.map(|dimension| dimension.resolve(available_width))
-                                .unwrap_or(available_width)
-                        }),
-                        allocated_height.unwrap_or_else(|| node_height(node, available_height)),
-                    ).into()],
-                )?;
-                self.send_msg_void(
-                    image_view,
-                    "setContentMode:",
-                    &[self.context.i64_type().const_int(mode.content_mode(), false).into()],
-                )?;
-                if *mode == ImageMode::AspectFill {
+                let frame = self.rect_constant(
+                    x,
+                    y,
+                    allocated_width.unwrap_or_else(|| {
+                        style.width.map(|dimension| dimension.resolve(available_width))
+                            .unwrap_or(available_width)
+                    }),
+                    allocated_height.unwrap_or_else(|| node_height(node, available_height)),
+                );
+                self.send_msg_void(image_view, "setFrame:", &[frame.into()])?;
+                if !self.is_mac() {
+                    self.send_msg_void(
+                        image_view,
+                        "setContentMode:",
+                        &[self.context.i64_type().const_int(mode.content_mode(), false).into()],
+                    )?;
+                }
+                if *mode == ImageMode::AspectFill && !self.is_mac() {
                     self.send_msg_void(
                         image_view,
                         "setClipsToBounds:",
                         &[self.context.bool_type().const_int(1, false).into()],
                     )?;
                 }
-                self.apply_inline_style(image_view, style, false)?;
-                Ok(image_view)
+                let padding = node_padding(style);
+                if padding.is_zero() {
+                    self.apply_inline_style(image_view, style, false)?;
+                    Ok(image_view)
+                } else {
+                    self.wrap_padded_leaf(image_view, style, frame, padding)
+                }
             }
             IRNode::Input {
                 placeholder,
@@ -5027,35 +5961,68 @@ impl<'ctx> IosCodeGen<'ctx> {
             } => {
                 if *unsupported_event_handler {
                     return Err(
-                        "Input callbacks support onInput={(value) => stateName = value} and onFocus={() => focused = true} for a boolean state"
+                        "Input callbacks support onInput={(value) => textState = value} and onFocus={() => booleanState = true}"
                             .into(),
                     );
                 }
-                let input = self.create_objc_instance_with_frame(
-                    "UITextField",
-                    self.rect_constant(
-                        x,
-                        y,
-                        allocated_width.unwrap_or_else(|| {
-                            style.width.map(|dimension| dimension.resolve(available_width))
-                                .unwrap_or(available_width)
-                        }),
-                        allocated_height.unwrap_or_else(|| node_height(node, available_height)),
-                    ),
-                )?;
+                let frame = self.rect_constant(
+                    x,
+                    y,
+                    allocated_width.unwrap_or_else(|| {
+                        style.width.map(|dimension| dimension.resolve(available_width))
+                            .unwrap_or(available_width)
+                    }),
+                    allocated_height.unwrap_or_else(|| node_height(node, available_height)),
+                );
+                let input = self.create_objc_instance_with_frame(self.input_class(), frame)?;
+                let padding = node_padding(style);
+                // 原生控件自带镀铬：iOS 的 borderStyle、macOS 的 bezel/焦点环会在我们画的
+                // 背景与圆角上再叠一层，三端观感就不一致。只要样式里给了背景或内边距，
+                // 就关掉原生镀铬，统一由 apply_box_style + padding 负责外观。
+                let custom_chrome = style.background_color.is_some() || !padding.is_zero();
                 if !placeholder.is_empty() {
-                    let placeholder = self.create_nsstring(placeholder)?;
-                    self.send_msg_void(input, "setPlaceholder:", &[placeholder.into()])?;
+                    self.set_placeholder(input, placeholder, style)?;
                 }
-                self.send_msg_void(
-                    input,
-                    "setBorderStyle:",
-                    &[self.context.i64_type().const_int(3, false).into()],
-                )?;
-                self.apply_inline_style(input, style, true)?;
-                if *on_input {
+                if self.is_mac() {
+                    let bezel = if custom_chrome { 0 } else { 1 };
+                    self.send_msg_void(
+                        input,
+                        "setBezeled:",
+                        &[self.context.i8_type().const_int(bezel, false).into()],
+                    )?;
+                    if custom_chrome {
+                        let no = self.context.i8_type().const_int(0, false);
+                        self.send_msg_void(input, "setBordered:", &[no.into()])?;
+                        self.send_msg_void(input, "setDrawsBackground:", &[no.into()])?;
+                        // NSFocusRingTypeNone：不要蓝色焦点环，与 iOS/Android 一致
+                        self.send_msg_void(
+                            input,
+                            "setFocusRingType:",
+                            &[self.context.i64_type().const_int(1, false).into()],
+                        )?;
+                    }
+                } else {
+                    let border_style = if custom_chrome { 0 } else { 3 };
+                    self.send_msg_void(
+                        input,
+                        "setBorderStyle:",
+                        &[self.context.i64_type().const_int(border_style, false).into()],
+                    )?;
+                }
+                if padding.is_zero() {
+                    self.apply_inline_style(input, style, true)?;
+                } else {
+                    self.apply_text_style(input, style)?;
+                }                // onInput / onFocus：iOS 走 UIControl 事件，AppKit 没有这套，改用
+                // NSTextField delegate 的 controlTextDidChange: 回调（见 build_input_delegate_method）。
+                if let Some(action_index) = on_input.filter(|_| self.is_mac()) {
                     let target = event_target.ok_or("Input onInput requires an event target")?;
-                    let action = self.get_selector("updateStateFromInput:")?;
+                    self.send_msg_void(input, "setDelegate:", &[target.into()])?;
+                    self.store_input_source(action_index, input)?;
+                }
+                if let Some(action_index) = on_input.filter(|_| !self.is_mac()) {
+                    let target = event_target.ok_or("Input onInput requires an event target")?;
+                    let action = self.get_selector(&format!("stateAction{action_index}:"))?;
                     self.send_msg_void(
                         input,
                         "addTarget:action:forControlEvents:",
@@ -5066,9 +6033,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                         ],
                     )?;
                 }
-                if *on_focus {
+                if let Some(action_index) = on_focus.filter(|_| !self.is_mac()) {
                     let target = event_target.ok_or("Input onFocus requires an event target")?;
-                    let action = self.get_selector("focusEvent:")?;
+                    let action = self.get_selector(&format!("stateAction{action_index}:"))?;
                     self.send_msg_void(
                         input,
                         "addTarget:action:forControlEvents:",
@@ -5079,7 +6046,11 @@ impl<'ctx> IosCodeGen<'ctx> {
                         ],
                     )?;
                 }
-                Ok(input)
+                if padding.is_zero() {
+                    Ok(input)
+                } else {
+                    self.wrap_padded_leaf(input, style, frame, padding)
+                }
             }
             IRNode::Button {
                 title,
@@ -5089,19 +6060,22 @@ impl<'ctx> IosCodeGen<'ctx> {
             } => {
                 if *unsupported_handler {
                     return Err(
-                        "supported Button onClick form is () => setState(state + 1) with a numeric useState"
+                        "supported Button onClick form is () => state++ / state-- / state = <literal> on a state(...) cell"
                             .into(),
                     );
                 }
-                let class = self.get_class("UIButton")?;
-                let button_type = self.get_selector("buttonWithType:")?;
-                let button = self
-                    .send_msg_ptr(
+                let button = if self.is_mac() {
+                    self.create_objc_instance_with_frame(self.button_class(), self.rect_constant(x, y, 0.0, 0.0))?
+                } else {
+                    let class = self.get_class(self.button_class())?;
+                    let button_type = self.get_selector("buttonWithType:")?;
+                    self.send_msg_ptr(
                         class,
                         button_type,
                         &[self.context.i64_type().const_int(0, false).into()],
                     )?
-                    .ok_or("UIButton buttonWithType: returned void")?;
+                    .ok_or("UIButton buttonWithType: returned void")?
+                };
                 self.send_msg_void(
                     button,
                     "setFrame:",
@@ -5116,26 +6090,42 @@ impl<'ctx> IosCodeGen<'ctx> {
                     ).into()],
                 )?;
                 let title = self.create_nsstring(title)?;
-                self.send_msg_void(
-                    button,
-                    "setTitle:forState:",
-                    &[title.into(), self.context.i64_type().const_int(0, false).into()],
-                )?;
-                self.apply_inline_style(button, style, false)?;
-                if let Some(color_name) = &style.color {
-                    let color = self.ui_color(color_name)?;
+                if self.is_mac() {
                     self.send_msg_void(
                         button,
-                        "setTitleColor:forState:",
-                        &[color.into(), self.context.i64_type().const_int(0, false).into()],
+                        "setBordered:",
+                        &[self.context.i8_type().const_int(0, false).into()],
+                    )?;
+                    self.send_msg_void(button, "setTitle:", &[title.into()])?;
+                } else {
+                    self.send_msg_void(
+                        button,
+                        "setTitle:forState:",
+                        &[title.into(), self.context.i64_type().const_int(0, false).into()],
                     )?;
                 }
+                self.apply_inline_style(button, style, false)?;
+                if let Some(padding) = style.padding {
+                    // 叶子的 padding 落在标题四周，与容器 padding 的语义一致
+                    let insets = self.ui_edge_insets(padding, padding, padding, padding);
+                    if !self.is_mac() {
+                        self.send_msg_void(button, "setContentEdgeInsets:", &[insets.into()])?;
+                    }
+                }
+                if let Some(color_name) = &style.color {
+                    let color = self.ui_color(color_name)?;
+                    if self.is_mac() {
+                        self.send_msg_void(button, "setContentTintColor:", &[color.into()])?;
+                    } else {
+                        self.send_msg_void(
+                            button,
+                            "setTitleColor:forState:",
+                            &[color.into(), self.context.i64_type().const_int(0, false).into()],
+                        )?;
+                    }
+                }
                 if let Some(font_size) = style.font_size {
-                    let title_label_sel = self.get_selector("titleLabel")?;
-                    let title_label = self
-                        .send_msg_ptr(button, title_label_sel, &[])?
-                        .ok_or("UIButton titleLabel returned void")?;
-                    let font_class = self.get_class("UIFont")?;
+                    let font_class = self.get_class(if self.is_mac() { "NSFont" } else { "UIFont" })?;
                     let system_font_sel = self.get_selector("systemFontOfSize:")?;
                     let font = self
                         .send_msg_ptr(
@@ -5143,8 +6133,15 @@ impl<'ctx> IosCodeGen<'ctx> {
                             system_font_sel,
                             &[self.context.f64_type().const_float(font_size).into()],
                         )?
-                        .ok_or("UIFont systemFontOfSize: returned void")?;
-                    self.send_msg_void(title_label, "setFont:", &[font.into()])?;
+                        .ok_or("systemFontOfSize: returned void")?;
+                    if self.is_mac() {
+                        self.send_msg_void(button, "setFont:", &[font.into()])?;
+                    } else {
+                        let title_label = self
+                            .send_msg_ptr(button, self.get_selector("titleLabel")?, &[])?
+                            .ok_or("UIButton titleLabel returned void")?;
+                        self.send_msg_void(title_label, "setFont:", &[font.into()])?;
+                    }
                 }
 
                 if let Some(action_index) = state_action {
@@ -5152,19 +6149,78 @@ impl<'ctx> IosCodeGen<'ctx> {
                         "Button onClick requires a state(...) declaration",
                     )?;
                     let action = self.get_selector(&format!("stateAction{action_index}:"))?;
-                    self.send_msg_void(
-                        button,
-                        "addTarget:action:forControlEvents:",
-                        &[
-                            target.into(),
-                            action.into(),
-                            self.context.i64_type().const_int(1 << 6, false).into(),
-                        ],
-                    )?;
+                    if self.is_mac() {
+                        self.send_msg_void(button, "setTarget:", &[target.into()])?;
+                        self.send_msg_void(button, "setAction:", &[action.into()])?;
+                    } else {
+                        self.send_msg_void(
+                            button,
+                            "addTarget:action:forControlEvents:",
+                            &[
+                                target.into(),
+                                action.into(),
+                                self.context.i64_type().const_int(1 << 6, false).into(),
+                            ],
+                        )?;
+                    }
                 }
                 Ok(button)
             }
         }
+    }
+
+    /// 占位符统一走 attributed 版本，颜色才能由样式（placeholderColor）控制：
+    /// UIKit 用 `attributedPlaceholder`，AppKit 用 `placeholderAttributedString`。
+    fn set_placeholder(
+        &self,
+        field: PointerValue<'ctx>,
+        text: &str,
+        style: &InlineStyle,
+    ) -> Result<(), String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let string = self.create_nsstring(text)?;
+        let color_name = style
+            .placeholder_color
+            .as_deref()
+            .unwrap_or(DEFAULT_PLACEHOLDER_COLOR);
+        let color = self.ui_color(color_name)?;
+        // NSForegroundColorAttributeName 是 AppKit/UIKit 导出的 NSString 常量，声明成外部符号
+        let key = match self.module.get_global("NSForegroundColorAttributeName") {
+            Some(global) => global,
+            None => self
+                .module
+                .add_global(ptr_type, None, "NSForegroundColorAttributeName"),
+        };
+        let key = self
+            .builder
+            .build_load(ptr_type, key.as_pointer_value(), "placeholder_key")
+            .map_err(|error| error.to_string())?
+            .into_pointer_value();
+        let dictionary_class = self.get_class("NSDictionary")?;
+        let attributes = self
+            .send_msg_ptr(
+                dictionary_class,
+                self.get_selector("dictionaryWithObject:forKey:")?,
+                &[color.into(), key.into()],
+            )?
+            .ok_or("NSDictionary dictionaryWithObject:forKey: returned void")?;
+        let attributed_class = self.get_class("NSAttributedString")?;
+        let alloc = self
+            .send_msg_ptr(attributed_class, self.get_selector("alloc")?, &[])?
+            .ok_or("NSAttributedString alloc returned void")?;
+        let attributed = self
+            .send_msg_ptr(
+                alloc,
+                self.get_selector("initWithString:attributes:")?,
+                &[string.into(), attributes.into()],
+            )?
+            .ok_or("NSAttributedString initWithString:attributes: returned void")?;
+        let selector = if self.is_mac() {
+            "setPlaceholderAttributedString:"
+        } else {
+            "setAttributedPlaceholder:"
+        };
+        self.send_msg_void(field, selector, &[attributed.into()])
     }
 
     fn apply_inline_style(
@@ -5173,11 +6229,88 @@ impl<'ctx> IosCodeGen<'ctx> {
         style: &InlineStyle,
         text_like: bool,
     ) -> Result<(), String> {
+        self.apply_box_style(view, style)?;
+        if text_like {
+            self.apply_text_style(view, style)?;
+        }
+        Ok(())
+    }
+
+    /// 设置背景色：UIKit 直接用 setBackgroundColor:，AppKit 要走 layer。
+    fn apply_background_color(
+        &self,
+        view: PointerValue<'ctx>,
+        color: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        if !self.is_mac() {
+            return self.send_msg_void(view, "setBackgroundColor:", &[color.into()]);
+        }
+        self.wants_layer(view)?;
+        let layer = self
+            .send_msg_ptr(view, self.get_selector("layer")?, &[])?
+            .ok_or("NSView layer returned void")?;
+        let cg_color = self
+            .send_msg_ptr(color, self.get_selector("CGColor")?, &[])?
+            .ok_or("NSColor CGColor returned void")?;
+        self.send_msg_void(layer, "setBackgroundColor:", &[cg_color.into()])
+    }
+
+    /// AppKit 的视图要显式开启 layer 才能画背景、边框和圆角。
+    fn wants_layer(&self, view: PointerValue<'ctx>) -> Result<(), String> {
+        if !self.is_mac() {
+            return Ok(());
+        }
+        self.send_msg_void(
+            view,
+            "setWantsLayer:",
+            &[self.context.i8_type().const_int(1, false).into()],
+        )
+    }
+
+    /// macOS 的 NSTextField 默认是输入框，需要先变成"标签"。
+    fn configure_label(&self, label: PointerValue<'ctx>) -> Result<(), String> {
+        if !self.is_mac() {
+            return Ok(());
+        }
+        // 默认左对齐，和 iOS 的 UILabel 保持一致
+        self.send_msg_void(
+            label,
+            "setAlignment:",
+            &[self.context.i64_type().const_int(0, false).into()],
+        )?;
+        for selector in [
+            "setBordered:",
+            "setBezeled:",
+            "setEditable:",
+            "setSelectable:",
+            "setDrawsBackground:",
+        ] {
+            self.send_msg_void(
+                label,
+                selector,
+                &[self.context.i8_type().const_int(0, false).into()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn set_label_text(
+        &self,
+        label: PointerValue<'ctx>,
+        text: PointerValue<'ctx>,
+    ) -> Result<(), String> {
+        let selector = if self.is_mac() { "setStringValue:" } else { "setText:" };
+        self.send_msg_void(label, selector, &[text.into()])
+    }
+
+    /// 盒子类样式：背景、边框、圆角。padding 会让它们落在包裹层上。
+    fn apply_box_style(&self, view: PointerValue<'ctx>, style: &InlineStyle) -> Result<(), String> {
         if let Some(color_name) = &style.background_color {
             let color = self.ui_color(color_name)?;
-            self.send_msg_void(view, "setBackgroundColor:", &[color.into()])?;
+            self.apply_background_color(view, color)?;
         }
         if style.border_width.is_some() || style.border_color.is_some() || style.border_radius.is_some() {
+            self.wants_layer(view)?;
             let layer = self
                 .send_msg_ptr(view, self.get_selector("layer")?, &[])?
                 .ok_or("UIView layer returned void")?;
@@ -5203,31 +6336,6 @@ impl<'ctx> IosCodeGen<'ctx> {
                 )?;
             }
         }
-        if text_like {
-            if let Some(alignment) = style.text_align {
-                self.send_msg_void(
-                    view,
-                    "setTextAlignment:",
-                    &[self.context.i64_type().const_int(alignment.ui_value(), false).into()],
-                )?;
-            }
-            if let Some(color_name) = &style.color {
-                let color = self.ui_color(color_name)?;
-                self.send_msg_void(view, "setTextColor:", &[color.into()])?;
-            }
-            if let Some(font_size) = style.font_size {
-                let font_class = self.get_class("UIFont")?;
-                let system_font = self.get_selector("systemFontOfSize:")?;
-                let font = self
-                    .send_msg_ptr(
-                        font_class,
-                        system_font,
-                        &[self.context.f64_type().const_float(font_size).into()],
-                    )?
-                    .ok_or("UIFont systemFontOfSize: returned void")?;
-                self.send_msg_void(view, "setFont:", &[font.into()])?;
-            }
-        }
         Ok(())
     }
 
@@ -5236,6 +6344,9 @@ impl<'ctx> IosCodeGen<'ctx> {
         view: PointerValue<'ctx>,
         style: &InlineStyle,
     ) -> Result<(), String> {
+        if self.is_mac() {
+            return Ok(());
+        }
         if style.background_extends_to_top {
             let target_global = self
                 .module
@@ -5269,9 +6380,74 @@ impl<'ctx> IosCodeGen<'ctx> {
         Ok(())
     }
 
+    /// 文本类样式：对齐、颜色、字号。
+    fn apply_text_style(&self, view: PointerValue<'ctx>, style: &InlineStyle) -> Result<(), String> {
+        if let Some(alignment) = style.text_align {
+            let selector = if self.is_mac() { "setAlignment:" } else { "setTextAlignment:" };
+            self.send_msg_void(
+                view,
+                selector,
+                &[self.context.i64_type().const_int(alignment.ui_value(), false).into()],
+            )?;
+        }
+        if let Some(color_name) = &style.color {
+            let color = self.ui_color(color_name)?;
+            self.send_msg_void(view, "setTextColor:", &[color.into()])?;
+        }
+        if let Some(font_size) = style.font_size {
+            let font_class = self.get_class(if self.is_mac() { "NSFont" } else { "UIFont" })?;
+            let system_font = self.get_selector("systemFontOfSize:")?;
+            let font = self
+                .send_msg_ptr(
+                    font_class,
+                    system_font,
+                    &[self.context.f64_type().const_float(font_size).into()],
+                )?
+                .ok_or("systemFontOfSize: returned void")?;
+            self.send_msg_void(view, "setFont:", &[font.into()])?;
+        }
+        Ok(())
+    }
+
+    /// 叶子的 padding：外面包一层容器承载背景/边框，内容按 padding 内缩。
+    /// 对齐 SwiftUI 的 `.padding(...).background(...)`。
+    fn wrap_padded_leaf(
+        &self,
+        leaf: PointerValue<'ctx>,
+        style: &InlineStyle,
+        frame: inkwell::values::StructValue<'ctx>,
+        padding: Padding,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let wrapper = self.create_objc_instance_with_frame(self.view_class(), frame)?;
+        self.apply_box_style(wrapper, style)?;
+        self.send_msg_void(
+            leaf,
+            "setTranslatesAutoresizingMaskIntoConstraints:",
+            &[self.context.bool_type().const_int(0, false).into()],
+        )?;
+        self.send_msg_void(wrapper, "addSubview:", &[leaf.into()])?;
+        self.add_anchor_constraint(leaf, "leadingAnchor", wrapper, "leadingAnchor", padding.left)?;
+        self.add_anchor_constraint(leaf, "topAnchor", wrapper, "topAnchor", padding.top)?;
+        self.add_anchor_constraint(
+            leaf,
+            "trailingAnchor",
+            wrapper,
+            "trailingAnchor",
+            -padding.right,
+        )?;
+        self.add_anchor_constraint(
+            leaf,
+            "bottomAnchor",
+            wrapper,
+            "bottomAnchor",
+            -padding.bottom,
+        )?;
+        Ok(wrapper)
+    }
+
     fn ui_color(&self, value: &str) -> Result<PointerValue<'ctx>, String> {
         if let Some((red, green, blue, alpha)) = parse_functional_color(value)? {
-            let color_class = self.get_class("UIColor")?;
+            let color_class = self.get_class(if self.is_mac() { "NSColor" } else { "UIColor" })?;
             let selector = self.get_selector("colorWithRed:green:blue:alpha:")?;
             return self
                 .send_msg_ptr(
@@ -5296,7 +6472,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             "clear" | "transparent" => "clearColor",
             _ => return Err(format!("unsupported inline color: {value}")),
         };
-        let color_class = self.get_class("UIColor")?;
+        let color_class = self.get_class(if self.is_mac() { "NSColor" } else { "UIColor" })?;
         let selector = self.get_selector(selector_name)?;
         self.send_msg_ptr(color_class, selector, &[])?
             .ok_or_else(|| format!("UIColor {selector_name} returned void"))
@@ -5330,6 +6506,9 @@ impl<'ctx> IosCodeGen<'ctx> {
     }
 
     fn screen_bounds(&self) -> Result<inkwell::values::StructValue<'ctx>, String> {
+        if self.is_mac() {
+            return Ok(self.rect_constant(0.0, 0.0, 420.0, 900.0));
+        }
         let screen_class = self.get_class("UIScreen")?;
         let main_screen_sel = self.get_selector("mainScreen")?;
         let screen = self
@@ -5384,6 +6563,25 @@ impl<'ctx> IosCodeGen<'ctx> {
             false,
         );
         self.context.const_struct(&[origin.into(), size.into()], false)
+    }
+
+    fn ui_edge_insets(
+        &self,
+        top: f64,
+        left: f64,
+        bottom: f64,
+        right: f64,
+    ) -> inkwell::values::StructValue<'ctx> {
+        let f64_type = self.context.f64_type();
+        self.context.const_struct(
+            &[
+                f64_type.const_float(top).into(),
+                f64_type.const_float(left).into(),
+                f64_type.const_float(bottom).into(),
+                f64_type.const_float(right).into(),
+            ],
+            false,
+        )
     }
 
     /// 生成 [[NSString alloc] initWithUTF8String:...]
@@ -5559,113 +6757,60 @@ fn send_msg_void(
 
 // ---------- main ----------
 
-fn main() {
-    let tsx_code = r#"
-function InsightCard({ title, height }) {
-    onMount(() => {});
-    onUnmount(() => {});
-    return <View style={{
-        width: "100%", height, padding: 18,
-        flexDirection: "column", justifyContent: "space-between",
-        backgroundColor: "rgb(235, 241, 252)", borderRadius: 16
-    }}>
-        <Text style={{ fontSize: 14, color: "gray" }}>CONDITIONAL COMPONENT</Text>
-        <Text style={{ fontSize: 22, color: "rgb(28, 39, 61)" }}>{title}</Text>
-    </View>;
-}
+/// 内置示例：名字 → 源码。`cargo run -- android todo` 编第二个，默认编 dashboard。
+const APPS: &[(&str, &str)] = &[
+    ("dashboard", include_str!("../app/App.tsx")),
+    ("todo", include_str!("../app/Todo.tsx")),
+];
 
-function App() {
-    const showInsight = state(false);
-    return <View style={{
-            width: "100%", height: "100%",
-            paddingHorizontal: 16,
-            backgroundColor: "rgb(242, 245, 250)",
-            flexDirection: "column",
-        }}>
-            <View style={{
-                id: "topBar",
-                backgroundExtendsTo: "top",
-                width: "100%", height: 44, padding: 12,
-                flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-                backgroundColor: "rgb(28, 39, 61)"
-            }}>
-                <Text style={{ fontSize: 22, color: "white", textAlign: "center" }}>My Dashboard</Text>
-                <Text style={{ fontSize: 14, color: "rgb(190, 205, 230)", textAlign: "center" }}>TODAY</Text>
-            </View>
-            <ScrollView style={{
-                fadeTarget: "topBar", fadeStart: 0, fadeDistance: 120,
-                width: "100%", flexGrow: 1, marginBottom: 92,
-                padding: 16, spacing: 14, backgroundColor: "white", borderRadius: 18
-            }}>
-                <Text style={{ fontSize: 26, color: "rgb(28, 39, 61)" }}>Reactive controls</Text>
-                <Text style={{ fontSize: 16, color: "gray" }}>Toggle a component to see reactive conditional rendering.</Text>
-                <View style={{
-                    width: "100%", height: 120, padding: 18,
-                    flexDirection: "column", justifyContent: "space-between",
-                    backgroundColor: "rgb(69, 104, 220)", borderRadius: 16
-                }}>
-                    <Text style={{ fontSize: 14, color: "rgb(220, 230, 255)" }}>CONDITIONAL STATE</Text>
-                    <Text style={{ fontSize: 22, color: "white" }}>{showInsight}</Text>
-                </View>
-                <Text style={{ fontSize: 18, color: "rgb(28, 39, 61)" }}>Conditional component</Text>
-                <View style={{
-                    width: "100%", height: 54, flexDirection: "row",
-                    alignItems: "center", justifyContent: "space-between", spacing: 10
-                }}>
-                    <Button
-                        title="Show component"
-                        onClick={() => showInsight = true}
-                        style={{ width: 140, height: 48, backgroundColor: "rgb(69, 104, 220)", color: "white", borderRadius: 12 }}
-                    />
-                    <Button
-                        title="Remove component"
-                        onClick={() => showInsight = false}
-                        style={{ width: 140, height: 48, backgroundColor: "rgb(35, 155, 110)", color: "white", borderRadius: 12 }}
-                    />
-                </View>
-                {showInsight && <InsightCard title="Props, lifecycle, and real view mounting" height={150} />}
-                <Text style={{ fontSize: 14, color: "gray" }}>The card receives scalar props and runs mount/unmount hooks as it is added or removed.</Text>
-                <Text style={{ fontSize: 18, color: "rgb(28, 39, 61)" }}>More to explore</Text>
-                <View style={{
-                    width: "100%", height: 190, padding: 18,
-                    flexDirection: "column", justifyContent: "space-between",
-                    backgroundColor: "rgb(235, 241, 252)", borderRadius: 16
-                }}>
-                    <Text style={{ fontSize: 14, color: "gray" }}>DAILY MOMENTUM</Text>
-                    <Text style={{ fontSize: 22, color: "rgb(28, 39, 61)" }}>Small steps build lasting progress.</Text>
-                </View>
-                <View style={{
-                    width: "100%", height: 190, padding: 18,
-                    flexDirection: "column", justifyContent: "space-between",
-                    backgroundColor: "rgb(232, 246, 239)", borderRadius: 16
-                }}>
-                    <Text style={{ fontSize: 14, color: "gray" }}>NEXT UP</Text>
-                    <Text style={{ fontSize: 22, color: "rgb(28, 39, 61)" }}>Keep your streak going tomorrow.</Text>
-                </View>
-            </ScrollView>
-            <View style={{
-                position: "absolute", left: 16, right: 16, bottom: 16,
-                height: 64, padding: 10, flexDirection: "row",
-                alignItems: "center", justifyContent: "space-between",
-                backgroundColor: "white", borderRadius: 18,
-                borderWidth: 1, borderColor: "rgb(222, 228, 238)"
-            }}>
-                <Text style={{ fontSize: 14, color: "gray" }}>One signal, updated in place</Text>
-                <Button
-                    title="Hide"
-                    onClick={() => showInsight = false}
-                    style={{ width: 100, height: 44, backgroundColor: "rgb(28, 39, 61)", color: "white", borderRadius: 12 }}
-                />
-            </View>
-        </View>
-}
-    "#;
+const DEFAULT_APP: &str = "dashboard";
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `cargo run -- macos` 生成 AppKit 版本，"ios"（默认）生成 UIKit 版本。
+    let platform = if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "macos" | "mac" | "--target=macos"))
+    {
+        Platform::MacOs
+    } else if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "android" | "--target=android"))
+    {
+        Platform::Android
+    } else {
+        Platform::Ios
+    };
+
+    // `--app=todo` 或直接写 `todo`；认不出来的 --app= 直接报错，避免默默编错页面。
+    let mut app = DEFAULT_APP.to_string();
+    for arg in &args {
+        if let Some(name) = arg.strip_prefix("--app=") {
+            if !APPS.iter().any(|(known, _)| *known == name) {
+                eprintln!(
+                    "unknown app '{name}', available: {}",
+                    APPS.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ")
+                );
+                std::process::exit(1);
+            }
+            app = name.to_string();
+        } else if APPS.iter().any(|(known, _)| *known == arg) {
+            app = arg.clone();
+        }
+    }
+    let tsx_code = APPS
+        .iter()
+        .find(|(name, _)| *name == app)
+        .map(|(_, source)| *source)
+        .unwrap_or(APPS[0].1);
+    println!("==> 编译示例: {app}");
 
     let program = parse_tsx_to_ast(tsx_code);
     println!("AST: {:#?}\n", program);
 
     let context = Context::create();
-    let mut codegen = IosCodeGen::new(&context);
+    let mut codegen = IosCodeGen::new_for(&context, platform);
     if let Err(e) = codegen.generate(&program) {
         eprintln!("codegen failed: {e}");
         std::process::exit(1);
@@ -5687,9 +6832,12 @@ mod tests {
                 </View>;
             }"#,
         );
-        let state = program.state.expect("state(...) should be parsed");
-        assert_eq!(state.name, "note");
-        assert_eq!(state.initial, StateValue::String(String::new()));
+        assert_eq!(program.states.len(), 1);
+        assert_eq!(program.states[0].name, "note");
+        assert_eq!(
+            program.states[0].initial,
+            StateInit::Scalar(StateValue::String(String::new()))
+        );
 
         let IRNode::View { children, .. } = &program.nodes[0] else {
             panic!("expected root View");
@@ -5698,22 +6846,137 @@ mod tests {
         assert!(matches!(
             children[1],
             IRNode::Input {
-                on_input: true,
-                on_focus: true,
+                on_input: Some(0),
+                on_focus: Some(1),
                 ..
             }
         ));
     }
 
     #[test]
-    fn parses_boolean_and_numeric_signal_initial_values() {
+    fn supports_multiple_independent_states() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const count = state(0);
+                const note = state("");
+                const shown = state(false);
+                return <View>
+                    <Text>{count}</Text>
+                    <Text>{note}</Text>
+                    {shown && <Text>visible</Text>}
+                    <Button onClick={() => count++}>Inc</Button>
+                    <Button onClick={() => note = "hi"}>Set</Button>
+                    <Button onClick={() => shown = true}>Show</Button>
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
         assert_eq!(
-            parse_state_config("const focused = state(false);").unwrap().initial,
-            StateValue::Boolean(false)
+            program.states.iter().map(|decl| decl.name.as_str()).collect::<Vec<_>>(),
+            vec!["count", "note", "shown"]
         );
         assert_eq!(
-            parse_state_config("const count = state(4);").unwrap().initial,
-            StateValue::Number(4)
+            program.state_actions,
+            vec![
+                StateMutation::Increment("count".into()),
+                StateMutation::Set("note".into(), StateValue::String("hi".into())),
+                StateMutation::SetTrue("shown".into()),
+            ]
+        );
+
+        let IRNode::View { children, .. } = &program.nodes[0] else {
+            panic!("expected root View");
+        };
+        assert!(matches!(&children[0], IRNode::StateText { cell, .. } if cell == "count"));
+        assert!(matches!(&children[1], IRNode::StateText { cell, .. } if cell == "note"));
+        assert!(matches!(&children[2], IRNode::Conditional { cell, .. } if cell == "shown"));
+    }
+
+    #[test]
+    fn expands_object_state_into_independent_cells() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const profile = state({ name: "", visits: 0, active: false });
+                return <View>
+                    <Text>{profile.name}</Text>
+                    <Text>{profile.visits}</Text>
+                    {profile.active && <Text>online</Text>}
+                    <Button onClick={() => profile.visits++}>Visit</Button>
+                    <Button onClick={() => profile.name = "Ada"}>Rename</Button>
+                    <Input onInput={(value) => profile.name = value} />
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+        assert_eq!(
+            program.states[0].cells(),
+            vec![
+                ("profile.name".to_string(), StateValue::String(String::new())),
+                ("profile.visits".to_string(), StateValue::Number(0)),
+                ("profile.active".to_string(), StateValue::Boolean(false)),
+            ]
+        );
+        assert_eq!(
+            program.state_actions,
+            vec![
+                StateMutation::Increment("profile.visits".into()),
+                StateMutation::Set("profile.name".into(), StateValue::String("Ada".into())),
+                StateMutation::SetFromInput("profile.name".into()),
+            ]
+        );
+
+        let IRNode::View { children, .. } = &program.nodes[0] else {
+            panic!("expected root View");
+        };
+        assert!(matches!(&children[0], IRNode::StateText { cell, .. } if cell == "profile.name"));
+        assert!(matches!(&children[2], IRNode::Conditional { cell, .. } if cell == "profile.active"));
+    }
+
+    #[test]
+    fn each_cell_gets_its_own_storage_and_label_list() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const a = state(1);
+                const b = state(2);
+                return <View>
+                    <Text>{a}</Text>
+                    <Text>{b}</Text>
+                    <Button onClick={() => a++}>IncA</Button>
+                    <Button onClick={() => b++}>IncB</Button>
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new(&context);
+        codegen.generate(&program).unwrap();
+        let generated_ir = codegen.module.print_to_string().to_string();
+        assert!(generated_ir.contains("g_state_cell_0"));
+        assert!(generated_ir.contains("g_state_cell_1"));
+        // 两个动作各自只刷新自己单元的标签
+        assert!(generated_ir.contains("app_delegate_state_action_0"));
+        assert!(generated_ir.contains("app_delegate_state_action_1"));
+        assert!(generated_ir.contains("stateAction0:"));
+        assert!(generated_ir.contains("stateAction1:"));
+    }
+
+    #[test]
+    fn parses_boolean_and_numeric_signal_initial_values() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const focused = state(false);
+                const count = state(4);
+                return <View><Text>{focused}</Text><Text>{count}</Text></View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+        assert_eq!(
+            program.states[0].initial,
+            StateInit::Scalar(StateValue::Boolean(false))
+        );
+        assert_eq!(
+            program.states[1].initial,
+            StateInit::Scalar(StateValue::Number(4))
         );
     }
 
@@ -5731,8 +6994,8 @@ mod tests {
         assert_eq!(
             program.state_actions,
             vec![
-                StateMutation::Decrement,
-                StateMutation::Set(StateValue::Number(12)),
+                StateMutation::Decrement("count".into()),
+                StateMutation::Set("count".into(), StateValue::Number(12)),
             ]
         );
     }
@@ -5741,12 +7004,13 @@ mod tests {
     fn generates_uikit_targets_for_signal_and_input_events() {
         let program = parse_tsx_to_ast(
             r#"function App() {
+                const note = state("");
                 const active = state(false);
                 return <View>
-                    <Text>{active}</Text>
+                    <Text>{note}</Text>
                     <Text>{active}</Text>
                     <Button onClick={() => active = true}>Activate</Button>
-                    <Input onInput={(value) => active = value} onFocus={() => active = true} />
+                    <Input onInput={(value) => note = value} onFocus={() => active = true} />
                 </View>;
             }"#,
         );
@@ -5755,7 +7019,8 @@ mod tests {
         codegen.generate(&program).unwrap();
         let generated_ir = codegen.module.print_to_string().to_string();
         assert!(generated_ir.contains("stateAction0:"));
-        assert!(generated_ir.contains("updateStateFromInput:"));
+        assert!(generated_ir.contains("stateAction1:"));
+        assert!(generated_ir.contains("g_state_cell_0"));
         assert!(generated_ir.contains("g_state_label_0"));
         assert!(generated_ir.contains("g_state_label_1"));
     }
@@ -5786,7 +7051,7 @@ mod tests {
             vec![
                 StateMutation::Noop,
                 StateMutation::Noop,
-                StateMutation::Set(StateValue::Boolean(true)),
+                StateMutation::SetTrue("shown".into()),
             ]
         );
 
@@ -5823,7 +7088,7 @@ mod tests {
     }
 
     #[test]
-    fn conditionals_mount_and_remove_views_in_a_flex_stack() {
+    fn conditionals_mount_and_unmount_branch_views() {
         let program = parse_tsx_to_ast(
             r#"function App() {
                 const shown = state(false);
@@ -5840,12 +7105,11 @@ mod tests {
         let mut codegen = IosCodeGen::new(&context);
         codegen.generate(&program).unwrap();
         let generated_ir = codegen.module.print_to_string().to_string();
-        assert!(generated_ir.contains("UIStackView"));
-        assert!(generated_ir.contains("insertArrangedSubview:atIndex:"));
-        assert!(generated_ir.contains("removeArrangedSubview:"));
+        // 真增删分支：卸载旧视图、挂载新视图并重建边约束，同时收缩槽位高度
         assert!(generated_ir.contains("removeFromSuperview"));
-        assert!(generated_ir.contains("setHidden:"));
+        assert!(generated_ir.contains("setConstant:"));
         assert!(generated_ir.contains("layoutIfNeeded"));
+        assert!(!generated_ir.contains("insertArrangedSubview:atIndex:"));
     }
 
     #[test]
@@ -5871,8 +7135,8 @@ mod tests {
         let generated_ir = codegen.module.print_to_string().to_string();
         assert!(generated_ir.contains("contentLayoutGuide"));
         assert!(generated_ir.contains("frameLayoutGuide"));
-        assert!(generated_ir.contains("insertArrangedSubview:atIndex:"));
-        assert!(generated_ir.contains("removeArrangedSubview:"));
+        assert!(generated_ir.contains("removeFromSuperview"));
+        assert!(!generated_ir.contains("insertArrangedSubview:atIndex:"));
     }
 
     #[test]
@@ -5972,6 +7236,140 @@ mod tests {
             .generate(&program)
             .unwrap_err()
             .contains("fadeDistance must be greater than zero"));
+    }
+
+    #[test]
+    fn top_bar_can_hug_the_physical_top_edge() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                return <View style={{ width: "100%", height: "100%" }}>
+                    <View style={{ ignoresSafeArea: "top", width: "100%", height: 44, backgroundColor: "blue" }}>
+                        <Text>Title</Text>
+                    </View>
+                    <ScrollView style={{ flexGrow: 1 }}>
+                        <Text>content</Text>
+                    </ScrollView>
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+        let IRNode::View { children, .. } = &program.nodes[0] else {
+            panic!("expected root View");
+        };
+        let IRNode::View { style, .. } = &children[0] else {
+            panic!("expected top bar View");
+        };
+        assert!(style.ignores_safe_area_top);
+
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new(&context);
+        codegen.generate(&program).unwrap();
+        let generated_ir = codegen.module.print_to_string().to_string();
+        assert!(generated_ir.contains("safeAreaLayoutGuide"));
+    }
+
+    #[test]
+    fn button_padding_becomes_content_edge_insets() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                return <View style={{ width: 320, height: 600 }}>
+                    <Button title="Show" style={{ width: 140, height: 48, padding: 10 }} />
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new(&context);
+        codegen.generate(&program).unwrap();
+        let generated_ir = codegen.module.print_to_string().to_string();
+        assert!(generated_ir.contains("setContentEdgeInsets:"));
+    }
+
+    #[test]
+    fn padding_shorthand_yields_to_per_edge_values() {
+        let style = InlineStyle {
+            padding: Some(10.0),
+            padding_top: Some(2.0),
+            padding_horizontal: Some(4.0),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            node_padding(&style),
+            Padding { top: 2.0, right: 4.0, bottom: 10.0, left: 4.0 }
+        );
+    }
+
+    #[test]
+    fn horizontal_padding_only_insets_the_horizontal_axis() {
+        let children = vec![IRNode::View {
+            style: InlineStyle {
+                width: Some(Dimension::Percent(1.0)),
+                height: Some(Dimension::Points(40.0)),
+                ..InlineStyle::default()
+            },
+            children: vec![],
+        }];
+        let style = InlineStyle {
+            padding_horizontal: Some(16.0),
+            flex_direction: Some(FlexDirection::Column),
+            ..InlineStyle::default()
+        };
+        let layouts = layout_flex_children(
+            &children,
+            &style,
+            320.0,
+            200.0,
+            FlexDirection::Column,
+            0.0,
+        );
+        assert_eq!(layouts[0].x, 16.0);
+        assert_eq!(layouts[0].y, 0.0);
+        assert_eq!(layouts[0].width, 288.0);
+    }
+
+    #[test]
+    fn padded_text_wraps_the_label_so_the_background_covers_the_padding() {
+        let generate = |padding: &str| {
+            let program = parse_tsx_to_ast(&format!(
+                r#"function App() {{
+                    return <View style={{{{ width: 320, height: 600 }}}}>
+                        <Text style={{{{ fontSize: 14{padding} }}}}>Hello</Text>
+                    </View>;
+                }}"#
+            ));
+            assert!(program.errors.is_empty(), "{:?}", program.errors);
+            let context = Context::create();
+            let mut codegen = IosCodeGen::new(&context);
+            codegen.generate(&program).unwrap();
+            codegen.module.print_to_string().to_string()
+        };
+
+        let plain = generate("");
+        let padded = generate(r#", padding: 8, backgroundColor: "rgb(255, 226, 0)""#);
+        let anchor_constraints = |ir: &str| ir.matches("constraintEqualToAnchor:constant:").count();
+        assert!(
+            anchor_constraints(&padded) > anchor_constraints(&plain),
+            "a padded label should be pinned inside an extra container"
+        );
+    }
+
+    #[test]
+    fn rejects_ignores_safe_area_without_fixed_height() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                return <View>
+                    <View style={{ ignoresSafeArea: "top", backgroundColor: "blue" }}>
+                        <Text>Title</Text>
+                    </View>
+                </View>;
+            }"#,
+        );
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new(&context);
+        assert!(codegen
+            .generate(&program)
+            .unwrap_err()
+            .contains("requires an explicit height"));
     }
 
     #[test]
@@ -6505,5 +7903,222 @@ mod tests {
         );
 
         assert_eq!(layouts[0].x, 110.0);
+    }
+
+    #[test]
+    fn android_backend_emits_jni_entries_and_state_units() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const shown = state(false);
+                const profile = state({ name: "guest", visits: 0 });
+                return <View style={{ flexDirection: "column", justifyContent: "space-between" }}>
+                    <View style={{ id: "topBar", backgroundColor: "rgb(20, 30, 40)" }}>
+                        <Text>Title</Text>
+                    </View>
+                    <ScrollView style={{ fadeTarget: "topBar", fadeDistance: 120 }}>
+                        {shown && <Text>shown</Text>}
+                        <Text>{profile.name}</Text>
+                        <Button title="Rename" onClick={() => profile.name = "Ada"} />
+                        <Button title="Visit" onClick={() => profile.visits++} />
+                        <View style={{ left: 16, right: 16, bottom: 10, height: 64 }}>
+                            <Input onInput={(value) => profile.name = value} />
+                        </View>
+                    </ScrollView>
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        let context = Context::create();
+        let codegen = IosCodeGen::new_for(&context, Platform::Android);
+        android::emit(&codegen, &program).unwrap();
+        let ir = codegen.module.print_to_string().to_string();
+
+        for entry in [
+            "Java_com_lumen_app_MainActivity_nativeCreate",
+            "Java_com_lumen_app_MainActivity_nativeOnClick",
+            "Java_com_lumen_app_MainActivity_nativeOnInput",
+            "Java_com_lumen_app_MainActivity_nativeOnScroll",
+        ] {
+            assert!(ir.contains(entry), "missing {entry}");
+        }
+        // 每个状态单元一套存储 + 刷新函数，条件分支有自己的开关
+        assert!(ir.contains("@g_cell_0 = "));
+        assert!(ir.contains("@g_cell_1_text = "));
+        assert!(ir.contains("@g_cell_2 = "));
+        assert!(ir.contains("define void @lumen_refresh_1()"));
+        assert!(ir.contains("define void @lumen_toggle_0()"));
+        assert!(ir.contains("@g_cond_0_slot = "));
+        // 渐显目标与滚动回调都接上了
+        assert!(ir.contains("@g_fade_view = "));
+        assert!(ir.contains("setOnScrollChangeListener"));
+        // 类 / 方法 ID 走 JNI 查找表，不再有 ObjC 运行时调用
+        assert!(!ir.contains("objc_msgSend"));
+        assert!(!ir.contains("UIApplicationMain"));
+    }
+
+    #[test]
+    fn conditional_updates_use_the_matching_slot_globals() {
+        // 多个条件时必须按“真实序号”取 g_conditional_height_<n>；
+        // 用过滤后的序号会让第二个条件的高度约束指向第一个条件（卡片挂上但高度为 0）。
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const a = state(false);
+                const b = state(false);
+                return <View>
+                    {a && <Text>a</Text>}
+                    {b && <Text>b</Text>}
+                    <Button title="A" onClick={() => a = true} />
+                    <Button title="B" onClick={() => b = true} />
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new(&context);
+        codegen.generate(&program).unwrap();
+        let ir = codegen.module.print_to_string().to_string();
+
+        let body_of = |name: &str| -> String {
+            let start = ir.find(&format!("define void @{name}")).expect("action exists");
+            let rest = &ir[start..];
+            let end = rest[1..].find("\ndefine ").map_or(rest.len(), |offset| offset + 1);
+            rest[..end].to_string()
+        };
+        let second = body_of("app_delegate_state_action_1");
+        assert!(
+            second.contains("@g_conditional_height_1"),
+            "第二个条件应该用 g_conditional_height_1，实际:\n{second}"
+        );
+        assert!(
+            !second.contains("@g_conditional_height_0"),
+            "不应该动到第一个条件的高度约束"
+        );
+    }
+
+    #[test]
+    fn macos_input_binding_uses_text_field_delegate() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const note = state("");
+                return <View>
+                    <Text>{note}</Text>
+                    <Input onInput={(value) => note = value} />
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new_for(&context, Platform::MacOs);
+        codegen.generate(&program).unwrap();
+        let ir = codegen.module.print_to_string().to_string();
+
+        // AppKit 没有 UIControl 事件：走 NSTextField 的 delegate 回调，取值用 stringValue
+        assert!(ir.contains("setDelegate:"));
+        assert!(ir.contains("controlTextDidChange:"));
+        assert!(ir.contains("app_delegate_control_text_did_change"));
+        assert!(ir.contains("stringValue"));
+        assert!(ir.contains("@g_input_source_0 = "));
+    }
+
+    #[test]
+    fn placeholder_color_is_style_driven_on_every_backend() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const note = state("");
+                return <View>
+                    <Input placeholder="default hint" onInput={(value) => note = value} />
+                    <Input
+                        placeholder="custom hint"
+                        onInput={(value) => note = value}
+                        style={{ placeholderColor: "rgb(1, 2, 3)" }}
+                    />
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        // 样式里的 placeholderColor 进 IR；不写时留 None，由后端用统一的默认色
+        let IRNode::View { children, .. } = &program.nodes[0] else {
+            panic!("expected root View");
+        };
+        let colors: Vec<_> = children
+            .iter()
+            .filter_map(|child| match child {
+                IRNode::Input { style, .. } => Some(style.placeholder_color.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colors, vec![None, Some("rgb(1, 2, 3)".to_string())]);
+
+        let context = Context::create();
+        let mut ios = IosCodeGen::new(&context);
+        ios.generate(&program).unwrap();
+        let ir = ios.module.print_to_string().to_string();
+        assert!(ir.contains("setAttributedPlaceholder:"));
+
+        let context = Context::create();
+        let android_codegen = IosCodeGen::new_for(&context, Platform::Android);
+        android::emit(&android_codegen, &program).unwrap();
+        let android_ir = android_codegen.module.print_to_string().to_string();
+        assert!(android_ir.contains("setHintTextColor"));
+    }
+
+    #[test]
+    fn bundled_apps_compile_for_every_backend() {
+        for (name, source) in APPS {
+            let program = parse_tsx_to_ast(source);
+            assert!(program.errors.is_empty(), "{name}: {:?}", program.errors);
+            for platform in [Platform::Ios, Platform::MacOs, Platform::Android] {
+                let context = Context::create();
+                let mut codegen = IosCodeGen::new_for(&context, platform);
+                codegen
+                    .generate(&program)
+                    .unwrap_or_else(|error| panic!("{name} / {platform:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn todo_app_expands_object_state_into_independent_cells() {
+        let source = APPS
+            .iter()
+            .find(|(name, _)| *name == "todo")
+            .map(|(_, source)| *source)
+            .expect("todo app is bundled");
+        let program = parse_tsx_to_ast(source);
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        // 4 个标题（字符串）+ 4 个勾选（布尔）+ 番茄计数 + 归档开关
+        let cells = state_cells(&program.states);
+        let paths: Vec<&str> = cells.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "titles.a",
+                "titles.b",
+                "titles.c",
+                "titles.d",
+                "done.a",
+                "done.b",
+                "done.c",
+                "done.d",
+                "pomodoro",
+                "archived",
+            ]
+        );
+
+        let context = Context::create();
+        let codegen = IosCodeGen::new_for(&context, Platform::Android);
+        android::emit(&codegen, &program).unwrap();
+        let ir = codegen.module.print_to_string().to_string();
+        // 四个勾选各自一个条件开关，列表里每项都能独立增删
+        for index in 0..4 {
+            assert!(ir.contains(&format!("@g_cond_{index}_slot = ")), "conditional {index}");
+        }
+        assert!(ir.contains("@g_cell_0_text = "), "titles.a 用字符串单元");
+        assert!(ir.contains("@g_cell_8 = "), "pomodoro 用数值单元");
     }
 }
