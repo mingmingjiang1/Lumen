@@ -6253,6 +6253,11 @@ impl<'ctx> IosCodeGen<'ctx> {
             .build_extract_value(rect, 1, "bounds_y")
             .map_err(|error| error.to_string())?
             .into_float_value();
+        // 生成的 documentView 是非翻转坐标：往下滚 bounds.origin.y 是负数，取反才是「已滚动距离」
+        let y = self
+            .builder
+            .build_float_neg(y, "bounds_scrolled")
+            .map_err(|error| error.to_string())?;
         let mut value = self
             .builder
             .build_float_to_signed_int(y, self.context.i64_type(), "scroll_int")
