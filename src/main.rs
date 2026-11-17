@@ -11874,6 +11874,43 @@ mod tests {
     }
 
     #[test]
+    fn web_backend_emits_state_and_dom_event_runtime() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const count = state(0);
+                const draft = state("");
+                const shown = state(false);
+                return <ScrollView onScroll={(y) => count = y} style={{ opacity: count }}>
+                    <Text>{count}</Text>
+                    <Text>{count + 1}</Text>
+                    <Button onClick={() => shown = true}>Show</Button>
+                    <Input onInput={(value) => draft = value} onFocus={() => shown = true} />
+                    {shown && <Text>Visible</Text>}
+                </ScrollView>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        let html = source_backend::generate_html(&program).unwrap();
+        assert!(html.contains("data-lumen-state=\"count\""), "{html}");
+        assert!(html.contains("data-lumen-expr="), "{html}");
+        assert!(html.contains("data-lumen-conditional=\"shown\""), "{html}");
+        assert!(html.contains("data-lumen-action="), "{html}");
+        assert!(html.contains("data-lumen-input-action="), "{html}");
+        assert!(html.contains("data-lumen-focus-action="), "{html}");
+        assert!(html.contains("data-lumen-scroll-action="), "{html}");
+        assert!(html.contains("data-lumen-opacity=\"count\""), "{html}");
+        assert!(html.contains("case \"increment\""), "{html}");
+        assert!(capabilities::check(&capabilities::WEB, &program, false)
+            .unwrap()
+            .iter()
+            .all(|warning| !warning.contains("onClick")
+                && !warning.contains("onInput")
+                && !warning.contains("onFocus")
+                && !warning.contains("onScroll")));
+    }
+
+    #[test]
     fn bundled_apps_compile_for_every_backend() {
         for (name, source) in APPS {
             let program = parse_tsx_to_ast(source);

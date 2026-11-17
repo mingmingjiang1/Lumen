@@ -182,7 +182,7 @@ function App() {
   `LinearLayout`，行内按钮把行号编码进点击 id（`1_000_000 + action*1024 + row`）再解码；
   列表容器和 Activity 都以 **global reference** 持有（local reference 跨 native 调用会失效，这是之前的崩溃点）；
 - Android 的差异：表达式文本只渲染初始值（不会随单元变化重算），行内条件在行构建时静态判断；
-- 平台：iOS / macOS / Android 都已实现（web 只输出初始行，不带交互）。树形行表（`children`）在
+- 平台：iOS / macOS / Android 都已实现（web 的列表只输出初始行，不能动态增删/更新）。树形行表（`children`）在
   iOS / Android 上按深度缩进平铺，web 用 `padding-left` 表达层级。
 
 ## 响应式原型（阶段 5）：递归组件（运行期槽位）
@@ -217,7 +217,7 @@ function App() {
   不变，`{tree.length}` 依然是整棵树的行数；
 - 各端落地：iOS/macOS 生成自调用的行函数 `list_row_<id>(index, depth)`，子行嵌在父行下面；
   Android 同一套模型（`list_row_<id>(container, index, depth)`，JNI 局部引用帧按行成对出入）；
-  web 是静态页，按初始行表递归输出嵌套 div；
+  web 按初始行表递归输出嵌套 div，列表运行期更新尚未接入；
 - 示例：`app/Tree.tsx`（`cargo run -- tree`）。
 
 ## 内置示例
@@ -274,7 +274,7 @@ swap rows（要同时改两行的字段）和任意行的 partial update（只�
 | Android | `adb shell dumpsys gfxinfo com.lumen.app` | Total frames / Janky frames / 50·90·99th |
 | iOS | `xcrun xctrace record --template 'Time Profiler'` + Instruments | 启动耗时、建行时的调用栈 |
 | macOS | 同 iOS | 同上 |
-| web | `cargo run -- web bench`，看 `out.html` 大小 | 产物体积（静态页只含初始行） |
+| web | `cargo run -- web bench`，看 `out.html` 大小 | 产物体积（列表只含初始行） |
 
 本机 Android 模拟器（软件渲染、带窗口，绝对数值偏悲观，只适合横向对比）实测：
 冷启动 6.1s / 8.3s / 10.3s（连续三次，随模拟器负载波动，**主要由进程启动 + JNI/ART 初始化决定，
@@ -420,7 +420,7 @@ function App() {
 - 滚动位置：iOS 走生成的 `scrollViewDidScroll:`（取 `contentOffset.y + adjustedContentInset.top`），
   macOS 走 `NSViewBoundsDidChange` 通知（clip view 的 `bounds.origin.y`，文档视图是 `isFlipped` 的，
   向下滚动时就是正数，不需要取反），Android 走 `nativeOnScroll(scrollY)`；写入后只刷新引用这个单元的文本，不重建视图树；
-- 每个 App 目前支持一个滚动绑定；web 静态页登记为「不带滚动交互」；
+- 每个 App 目前支持一个滚动绑定；web 通过 DOM scroll 事件同步状态；
 - `app/Bench.tsx` 拿它显示当前滚动位置，滚动时数字会实时变化。
 
 有了这个能力，「滚动渐显」就能逐步从 `fadeTarget` 改写成 TSX：`onScroll` 写位置 → 透明度绑样式。
@@ -438,7 +438,7 @@ const offset = state(0);
 - iOS/macOS 在 `update_cell_labels` 里顺带 `setAlpha:`（AppKit 是 `setAlphaValue:`），Android 在各单元的
   `lumen_refresh_N` 里顺带 `setAlpha`，所以和文本刷新是同一条路径——滚动时只更新这一个视图，不重建视图树；
 - 写死的透明度（`opacity: 0`）也走同一套，三端一致；
-- web 是静态页，只渲染**初始值**（没有运行时更新）；
+- web 会在浏览器中同步标量状态、条件分支、表达式和透明度；列表仍只渲染**初始行**；
 - 顺手修掉一个 Android 侧的真坑：绑定的视图句柄必须存 **global ref**，存 local ref 的话
   native 调用返回后句柄失效，滚动时会直接 SIGSEGV（`lumen_refresh_N` 里踩过）。
 
@@ -479,7 +479,7 @@ tools/wasm/shot.sh /tmp/x.png "清空"   # 截图，并先按文字点一下按�
 node tools/wasm/trace.mjs          # 不开浏览器：用打点桩跑一遍 wasm，看 dom.* 调用序列
 ```
 
-当前状态（以 `bench` 为准，和 `cargo run -- web bench` 的静态页对照过截图）：
+当前状态（以 `bench` 为准，和 `cargo run -- web bench` 的生成页面对照过截图）：
 
 - ✅ 静态渲染：文本、按钮、卡片、圆角/边框/背景、绝对定位底栏、200 行的列表；
 - ✅ 按钮：追加 / 清空 / 行内选中 / 行内删除，整表重建后行数、`{rows.length}` 同步更新；
@@ -548,3 +548,14 @@ scripts/verify.sh todo       # 平台验证矩阵：构建 / 启动 / 断言逐�
  ios: 
  web: cargo run -- web dashboard
 
+
+1. native api(like request)
+2. event
+3. code split
+4. other basic style
+5. other basic component
+6. build script opt, eg: lumen --target = ios \ lumen --target = mac \ lumen --target = android \ lumen --target = win \ lumen --target = harmony \ lumen --target = web(default) \ lumen --target = custom dsl(like miniprogram)
+7. complex component (router/store)
+8. custom feature (like component & native module bases on rust)
+9. lazy load
+10. music app & agent app

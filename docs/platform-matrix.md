@@ -10,7 +10,7 @@
 | iOS（UIKit） | `cargo run -- <app>` + `run.sh shot` | 模拟器启动 + 截图 | `scripts/parity.sh`：占位符颜色采样 | 需人工（模拟器里点） | 构建/启动/截图/颜色自动，交互人工 |
 | macOS（AppKit） | `mac.sh`（`--allow-degrade`） | 打开窗口 | 需人工看窗口 | 需人工 | 构建自动，其余人工 |
 | Android（View） | `android/build-apk.sh` | `run-apk.sh` 装到模拟器 | `scripts/parity.sh`：视图树几何 + 占位符颜色 | `uiautomator` 坐标点击可脚本化 | 构建/启动/几何/颜色/交互全自动 |
-| Web（生成源码） | `cargo run -- web <app>` → `out.html` | Chrome headless 截图 | `scripts/parity.sh`：HTML 结构断言 | 静态页面，无交互 | 全自动（仅结构） |
+| Web（生成源码） | `cargo run -- web <app>` → `out.html` | Chrome 打开生成页面 | `scripts/parity.sh`：HTML 结构断言 | 标量状态、条件渲染、按钮/输入/焦点/滚动事件 | 构建/结构自动，交互可在浏览器验证 |
 | Wasm（DOM 桥） | `LUMEN_APP=<app> ./wasm.sh` → `out-wasm.html` | Chrome headless 打开页面 | 截图对照 web 参考页（`tools/wasm/shot.sh`） | 按钮/列表重建/滚动/透明度已接 | 全自动（截图 + 可选点击冒烟） |
 
 ## 每条平台命令
@@ -19,7 +19,7 @@
 # 1) 编译器测试（含两个内置示例 × 三个原生后端）
 cargo test
 
-# 2) 生成源码型后端：静态 HTML
+# 2) 生成源码型后端：交互式 HTML
 cargo run -- web todo        # 写 out.html
 open out.html
 
@@ -52,12 +52,12 @@ LUMEN_APP=todo ./mac.sh      # 启动后人工点击「完成 / 展开 / 输入�
 
 | 能力 | iOS | macOS | Android | Web | Wasm |
 | --- | --- | --- | --- | --- |
-| `onScroll`（滚动事件） | ✅ `scrollViewDidScroll:` | ✅ `NSViewBoundsDidChange` 通知 | ✅ `nativeOnScroll` | ⚠️ 静态页不做 | ✅ `dom.scrollCallback` → `lumen_scroll` |
-| `opacity`（绑定数值单元） | ✅ `setAlpha:` | ✅ `setAlphaValue:` | ✅ `setAlpha` | ⚠️ 只渲染初始值 | ✅ `dom.alpha` |
+| `onScroll`（滚动事件） | ✅ `scrollViewDidScroll:` | ✅ `NSViewBoundsDidChange` 通知 | ✅ `nativeOnScroll` | ✅ DOM scroll 事件 | ✅ `dom.scrollCallback` → `lumen_scroll` |
+| `opacity`（绑定数值单元） | ✅ `setAlpha:` | ✅ `setAlphaValue:` | ✅ `setAlpha` | ✅ 状态变化同步到 CSS | ✅ `dom.alpha` |
 | `ScrollView` | ✅ | ✅ | ✅ | ✅ | ✅（内容层 + `overflow-y:auto`） |
-| `onClick` | ✅ | ✅ | ✅ | ⚠️ 无交互 | ✅ `dom.callback` → `lumen_action` |
-| `onInput` / `onFocus` | ✅ | ❌ 未实现 | ✅ | ⚠️ 无交互 | ⚠️ 只渲染外观 |
-| `List`（运行期建行） | ✅ | ✅ | ✅ | ⚠️ 只输出初始行 | ✅ 整表重建 |
+| `onClick` | ✅ | ✅ | ✅ | ✅ DOM click 事件 | ✅ `dom.callback` → `lumen_action` |
+| `onInput` / `onFocus` | ✅ | ❌ 未实现 | ✅ | ✅ DOM input / focus 事件 | ⚠️ 只渲染外观 |
+| `List`（运行期建行） | ✅ | ✅ | ✅ | ⚠️ 只输出初始行，不能动态增删/更新 | ✅ 整表重建 |
 | `Image` | ✅ | ✅ | ⚠️ 只占位 | ⚠️ 只占位 | ⚠️ 只占位 |
 | `ignoresSafeArea` / `backgroundExtendsTo` | ✅ | ⚠️ 按普通背景 | ⚠️ 宿主补状态栏内边距 | ⚠️ 忽略 | ⚠️ 忽略 |
 | `NestedList`（树形行表） | ✅ 平铺 + 深度缩进 | ✅ 同 iOS | ✅ 平铺 + 深度缩进 | ⚠️ 只输出初始行 | ⚠️ 平铺 + 深度缩进 |

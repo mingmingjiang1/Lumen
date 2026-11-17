@@ -152,14 +152,10 @@ pub(crate) const ANDROID: Backend = Backend {
     ],
 };
 
-/// 生成源码型后端（当前目标：静态 HTML，用于视觉对照）。
+/// 生成源码型后端（当前目标：可交互 HTML；列表数据仍只渲染初始行）。
 pub(crate) const WEB: Backend = Backend {
     name: "web",
     exceptions: &[
-        ("onClick", Support::Emulated("静态 HTML 不带交互，仅用于视觉对照")),
-        ("onInput", Support::Emulated("静态 HTML 不带交互，仅用于视觉对照")),
-        ("onScroll", Support::Emulated("静态 HTML 不带滚动交互")),
-        ("onFocus", Support::Emulated("静态 HTML 不带交互，仅用于视觉对照")),
         (
             "ignoresSafeArea",
             Support::Emulated("按普通布局渲染，不模拟安全区"),
@@ -170,7 +166,7 @@ pub(crate) const WEB: Backend = Backend {
         ),
         (
             "List",
-            Support::Emulated("静态 HTML 只输出初始行"),
+            Support::Emulated("列表只输出初始行，运行期增删和行字段更新尚未接入"),
         ),
         (
             "NestedList",
@@ -296,11 +292,17 @@ fn collect_node(node: &IRNode, out: &mut BTreeSet<&'static str>) {
     collect_style(style, out);
 
     match node {
-        IRNode::View { children, .. }
-        | IRNode::VStack { children, .. }
-        | IRNode::ScrollView { children, .. } => {
+        IRNode::View { children, .. } | IRNode::VStack { children, .. } => {
             for child in children {
                 collect_node(child, out);
+            }
+        }
+        IRNode::ScrollView { style, children } => {
+            for child in children {
+                collect_node(child, out);
+            }
+            if style.scroll_action.is_some() {
+                out.insert("onScroll");
             }
         }
         IRNode::Conditional {
@@ -339,11 +341,6 @@ fn collect_node(node: &IRNode, out: &mut BTreeSet<&'static str>) {
             }
             if on_focus.is_some() {
                 out.insert("onFocus");
-            }
-        }
-        IRNode::ScrollView { style, .. } => {
-            if style.scroll_action.is_some() {
-                out.insert("onScroll");
             }
         }
         IRNode::Button { state_action, .. } => {

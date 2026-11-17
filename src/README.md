@@ -178,7 +178,7 @@ function App() {
   `LinearLayout`，行内按钮把行号编码进点击 id（`1_000_000 + action*1024 + row`）再解码；
   列表容器和 Activity 都以 **global reference** 持有（local reference 跨 native 调用会失效，这是之前的崩溃点）；
 - Android 的差异：表达式文本只渲染初始值（不会随单元变化重算），行内条件在行构建时静态判断；
-- 平台：iOS / macOS / web 已实现（web 只输出初始行，不带交互），Android 后端还没有列表渲染，
+- 平台：iOS / macOS / web 已实现（web 的列表只输出初始行，不能动态增删/更新），Android 后端还没有列表渲染，
   能力表会直接报错（`--allow-degrade` 时退化成空容器）。
 
 ## 内置示例
