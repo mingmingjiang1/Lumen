@@ -11,6 +11,7 @@
 | macOS（AppKit） | `mac.sh`（`--allow-degrade`） | 打开窗口 | 需人工看窗口 | 需人工 | 构建自动，其余人工 |
 | Android（View） | `android/build-apk.sh` | `run-apk.sh` 装到模拟器 | `scripts/parity.sh`：视图树几何 + 占位符颜色 | `uiautomator` 坐标点击可脚本化 | 构建/启动/几何/颜色/交互全自动 |
 | Web（生成源码） | `cargo run -- web <app>` → `out.html` | Chrome headless 截图 | `scripts/parity.sh`：HTML 结构断言 | 静态页面，无交互 | 全自动（仅结构） |
+| Wasm（DOM 桥） | `LUMEN_APP=<app> ./wasm.sh` → `out-wasm.html` | Chrome headless 打开页面 | 截图对照 web 参考页（`tools/wasm/shot.sh`） | 按钮/列表重建/滚动/透明度已接 | 全自动（截图 + 可选点击冒烟） |
 
 ## 每条平台命令
 
@@ -49,16 +50,18 @@ LUMEN_APP=todo ./mac.sh      # 启动后人工点击「完成 / 展开 / 输入�
 
 `src/capabilities.rs` 里每个后端登记了例外项，编译时会校验：
 
-| 能力 | iOS | macOS | Android | Web |
+| 能力 | iOS | macOS | Android | Web | Wasm |
 | --- | --- | --- | --- | --- |
-| `onScroll`（滚动事件） | ✅ `scrollViewDidScroll:` | ✅ `NSViewBoundsDidChange` 通知 | ✅ `nativeOnScroll` | ⚠️ 静态页不做 |
-| `opacity`（绑定数值单元） | ✅ `setAlpha:` | ✅ `setAlphaValue:` | ✅ `setAlpha` | ⚠️ 只渲染初始值 |
-| `ScrollView` | ✅ | ✅ | ✅ | ✅ |
-| `onFocus` | ✅ | ❌ 未实现 | ✅ | ⚠️ 无交互 |
-| `Image` | ✅ | ✅ | ⚠️ 只占位 | ⚠️ 只占位 |
-| `ignoresSafeArea` / `backgroundExtendsTo` | ✅ | ⚠️ 按普通背景 | ⚠️ 宿主补状态栏内边距 | ⚠️ 忽略 |
-| `NestedList`（树形行表） | ✅ 平铺 + 深度缩进 | ✅ 同 iOS | ✅ 平铺 + 深度缩进 | ⚠️ 只输出初始行 |
-| `RecursiveComponent`（运行期递归槽位） | ✅ 子树内嵌 | ✅ 同 iOS | ✅ 子树内嵌 | ⚠️ 只输出初始树 |
+| `onScroll`（滚动事件） | ✅ `scrollViewDidScroll:` | ✅ `NSViewBoundsDidChange` 通知 | ✅ `nativeOnScroll` | ⚠️ 静态页不做 | ✅ `dom.scrollCallback` → `lumen_scroll` |
+| `opacity`（绑定数值单元） | ✅ `setAlpha:` | ✅ `setAlphaValue:` | ✅ `setAlpha` | ⚠️ 只渲染初始值 | ✅ `dom.alpha` |
+| `ScrollView` | ✅ | ✅ | ✅ | ✅ | ✅（内容层 + `overflow-y:auto`） |
+| `onClick` | ✅ | ✅ | ✅ | ⚠️ 无交互 | ✅ `dom.callback` → `lumen_action` |
+| `onInput` / `onFocus` | ✅ | ❌ 未实现 | ✅ | ⚠️ 无交互 | ⚠️ 只渲染外观 |
+| `List`（运行期建行） | ✅ | ✅ | ✅ | ⚠️ 只输出初始行 | ✅ 整表重建 |
+| `Image` | ✅ | ✅ | ⚠️ 只占位 | ⚠️ 只占位 | ⚠️ 只占位 |
+| `ignoresSafeArea` / `backgroundExtendsTo` | ✅ | ⚠️ 按普通背景 | ⚠️ 宿主补状态栏内边距 | ⚠️ 忽略 | ⚠️ 忽略 |
+| `NestedList`（树形行表） | ✅ 平铺 + 深度缩进 | ✅ 同 iOS | ✅ 平铺 + 深度缩进 | ⚠️ 只输出初始行 | ⚠️ 平铺 + 深度缩进 |
+| `RecursiveComponent`（运行期递归槽位） | ✅ 子树内嵌 | ✅ 同 iOS | ✅ 子树内嵌 | ⚠️ 只输出初始树 | ⚠️ 子树内嵌（未逐项验证） |
 
 `--allow-degrade` 会把 ❌ 降级成 warning（`mac.sh` 就是这么跑两个示例的）。
 

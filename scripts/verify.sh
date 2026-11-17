@@ -13,6 +13,7 @@ cd "$ROOT" || exit 1
 result_build=skip
 result_launch=skip
 result_web=skip
+result_wasm=skip
 result_android=skip
 
 echo "== 1) 编译器测试 =="
@@ -29,6 +30,17 @@ if cargo run -q -- web "$APP" > /tmp/lumen-verify-web.log 2>&1; then
 else
   result_web="❌ 生成失败"
   echo "   ❌ 生成失败（见 /tmp/lumen-verify-web.log）"
+fi
+
+echo "== 2b) wasm 后端（DOM 桥） =="
+if LUMEN_APP="$APP" ./wasm.sh > /tmp/lumen-verify-wasm.log 2>&1; then
+  if [ -f out-wasm.html ]; then
+    result_wasm="✅ out-wasm.html $(wc -c < out-wasm.html | tr -d ' ')B"
+    echo "   ✅ out-wasm.html 生成成功"
+  fi
+else
+  result_wasm="❌ 生成失败"
+  echo "   ❌ wasm 生成失败（见 /tmp/lumen-verify-wasm.log）"
 fi
 
 echo "== 3) iOS =="
@@ -81,5 +93,6 @@ printf '%-10s %-22s %-22s %s\n' "平台" "构建" "启动/渲染" "视觉断言"
 printf '%-10s %-22s %-22s %s\n' "iOS" "$result_build" "$result_launch" "scripts/parity.sh（颜色采样）"
 printf '%-10s %-22s %-22s %s\n' "Android" "$result_android" "$result_android" "scripts/parity.sh（几何 + 颜色）"
 printf '%-10s %-22s %-22s %s\n' "Web" "$result_web" "static" "scripts/parity.sh（结构）"
+printf '%-10s %-22s %-22s %s\n' "Wasm" "$result_wasm" "Chrome 打开 out-wasm.html" "tools/wasm/shot.sh（截图/点击）"
 printf '%-10s %-22s %-22s %s\n' "macOS" "✅ IR" "人工" "人工看窗口"
 echo "详细说明：docs/platform-matrix.md"

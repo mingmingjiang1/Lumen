@@ -5,6 +5,9 @@
 # 编译产物
 out.ll
 out.html
+out.wasm
+out-wasm.html
+out-wasm.ll
 *.o
 Demo
 

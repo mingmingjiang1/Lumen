@@ -1,6 +1,7 @@
 mod android;
 mod capabilities;
 mod source_backend;
+mod view_backend;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -3894,10 +3895,10 @@ struct IosCodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    // 缓存三个 Objective-C runtime 的外部函数声明
-    objc_get_class: FunctionValue<'ctx>,
-    objc_msg_send: FunctionValue<'ctx>,
-    sel_register_name: FunctionValue<'ctx>,
+    /// 视图后端形态：iOS / macOS 走 objc_msgSend，wasm 走 DOM 桥（入口见 view_backend）
+    view_kind: view_backend::Kind,
+    /// DOM import 的声明缓存（`dom.*` 函数只声明一次）
+    dom_imports: RefCell<HashMap<&'static str, FunctionValue<'ctx>>>,
     /// 每个状态单元各自持有引用它的标签，更新时只触碰这一组。
     state_label_globals: RefCell<HashMap<String, Vec<GlobalValue<'ctx>>>>,
     state_label_counter: Cell<usize>,
@@ -4009,28 +4010,18 @@ impl<'ctx> IosCodeGen<'ctx> {
         }));
 
         let ptr_type = context.ptr_type(AddressSpace::default());
-        let i8_ptr = context.ptr_type(AddressSpace::default());
-
-        // 声明：id objc_getClass(const char *)
-        let get_class_type = ptr_type.fn_type(&[i8_ptr.into()], false);
-        let objc_get_class = module.add_function("objc_getClass", get_class_type, None);
-
-        // 声明：SEL sel_registerName(const char *)
-        let sel_type = ptr_type.fn_type(&[i8_ptr.into()], false);
-        let sel_register_name = module.add_function("sel_registerName", sel_type, None);
-
-        // 声明：id objc_msgSend(id, SEL, ...)  可变参数
-        let msg_send_type = ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], true);
-        let objc_msg_send = module.add_function("objc_msgSend", msg_send_type, None);
-
+        let _ = ptr_type;
+        let kind = match platform {
+            Platform::Wasm => view_backend::Kind::Dom,
+            _ => view_backend::Kind::Objc,
+        };
         Self {
             platform,
             context,
             module,
             builder,
-            objc_get_class,
-            objc_msg_send,
-            sel_register_name,
+            view_kind: kind,
+            dom_imports: RefCell::new(HashMap::new()),
             state_label_globals: RefCell::new(HashMap::new()),
             state_label_counter: Cell::new(0),
             state_cells: RefCell::new(Vec::new()),
@@ -4051,6 +4042,17 @@ impl<'ctx> IosCodeGen<'ctx> {
 
     fn is_mac(&self) -> bool {
         self.platform.is_mac()
+    }
+
+    /// 视图后端句柄：三个入口（建对象 / 取值消息 / 置值消息）都在这里。
+    fn view(&self) -> view_backend::ViewBackend<'ctx, '_> {
+        view_backend::ViewBackend::new(
+            self.view_kind,
+            self.context,
+            &self.module,
+            &self.builder,
+            &self.dom_imports,
+        )
     }
 
     fn view_class(&self) -> &'static str {
@@ -4098,13 +4100,8 @@ impl<'ctx> IosCodeGen<'ctx> {
         if self.platform.is_android() {
             return self.generate_android(program);
         }
-        // wasm 目标：IR/链接链路已通，但视图层还没从 objc_msgSend 换成 DOM 桥。
-        // 这里显式挡住，避免产出一个「能链成 .wasm 但什么都不会画」的假成功。
         if self.platform == Platform::Wasm {
-            return Err(
-                "wasm 后端还没接 DOM 桥：视图调用仍是 objc_msgSend。\n                 已完成：Platform::Wasm / wasm32 三元组 / rust-lld 链接 / tools/wasm/bridge.js / wasm.sh。\n                 待完成：把 send_msg_void/send_msg_ptr 在 Platform::Wasm 下分派到 dom.* import。"
-                    .into(),
-            );
+            return self.generate_wasm(program);
         }
         *self.state_cells.borrow_mut() = state_cells(&program.states);
         if program.states.is_empty() && program.nodes.iter().any(node_has_input_binding) {
@@ -4182,7 +4179,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             let app = self
                 .send_msg_ptr(
                     self.get_class("NSApplication")?,
-                    self.get_selector("sharedApplication")?,
+                    "sharedApplication",
                     &[],
                 )?
                 .ok_or("NSApplication sharedApplication returned void")?;
@@ -4193,10 +4190,10 @@ impl<'ctx> IosCodeGen<'ctx> {
             )?;
             let delegate_class = self.get_class("AppDelegate")?;
             let delegate = self
-                .send_msg_ptr(delegate_class, self.get_selector("alloc")?, &[])?
+                .send_msg_ptr(delegate_class, "alloc", &[])?
                 .ok_or("AppDelegate alloc returned void")?;
             let delegate = self
-                .send_msg_ptr(delegate, self.get_selector("init")?, &[])?
+                .send_msg_ptr(delegate, "init", &[])?
                 .ok_or("AppDelegate init returned void")?;
             if let Some(global) = self.module.get_global("g_app_delegate") {
                 self.builder
@@ -4320,6 +4317,234 @@ impl<'ctx> IosCodeGen<'ctx> {
         Ok(())
     }
 
+    /// wasm 入口：整棵视图树在 `main` 里建一次，节点全部落在 `dom.*` import 上。
+    /// 浏览器侧由 tools/wasm/bridge.js 调 `main()`，再把根节点挂到 `#root`。
+    fn generate_wasm(&self, program: &UiProgram) -> Result<(), String> {
+        *self.state_cells.borrow_mut() = state_cells(&program.states);
+        if program.states.is_empty() && program.nodes.iter().any(node_has_input_binding) {
+            return Err("Input onInput requires a state(...) declaration".into());
+        }
+        if count_scroll_actions(&program.nodes) > 1 {
+            return Err("this compiler phase supports one ScrollView onScroll binding per App".into());
+        }
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i32_type = self.context.i32_type();
+        let main_fn = self
+            .module
+            .add_function("main", i32_type.fn_type(&[], false), None);
+        let entry = self.context.append_basic_block(main_fn, "entry");
+        self.builder.position_at_end(entry);
+
+        for name in ["g_root_view", "g_event_target"] {
+            if self.module.get_global(name).is_none() {
+                let global = self.module.add_global(ptr_type, None, name);
+                global.set_initializer(&ptr_type.const_null());
+            }
+        }
+        for index in 0..self.state_cells.borrow().len() {
+            let global = self
+                .module
+                .add_global(ptr_type, None, &format!("g_state_cell_{index}"));
+            global.set_initializer(&ptr_type.const_null());
+        }
+
+        // DOM 侧的点击回调只认动作编号，事件目标在 wasm 上没有对象可传。
+        self.emit_ui_construction(program, ptr_type.const_null())?;
+
+        let root_global = self
+            .module
+            .get_global("g_root_view")
+            .ok_or("root view global was not created")?;
+        let root = self
+            .builder
+            .build_load(ptr_type, root_global.as_pointer_value(), "root")
+            .map_err(|error| error.to_string())?
+            .into_pointer_value();
+        self.view().dom_statement("attach", &[root.into()])?;
+        self.builder
+            .build_return(Some(&i32_type.const_int(0, false)))
+            .map_err(|error| error.to_string())?;
+
+        // 交互入口：桥在点击时调 `lumen_action(action, row)`
+        self.build_dom_action_dispatch(program)?;
+        // 滚动入口：桥在 scroll 时调 `lumen_scroll(y)`
+        self.build_dom_scroll_writer(program)?;
+
+        self.module.verify().map_err(|error| error.to_string())?;
+        self.module
+            .print_to_file("out.ll")
+            .map_err(|error| error.to_string())?;
+        println!("LLVM IR 已写入 out.ll (target: wasm32-unknown-unknown)");
+        Ok(())
+    }
+
+    /// `lumen_action(i32 action, i32 row)` 的声明：建视图时（生命周期回调）
+    /// 就要调到它，函数体可以晚一步再填。
+    fn dom_action_declaration(&self) -> FunctionValue<'ctx> {
+        let i32_type = self.context.i32_type();
+        let fn_type = self
+            .context
+            .void_type()
+            .fn_type(&[i32_type.into(), i32_type.into()], false);
+        self.module
+            .get_function("lumen_action")
+            .unwrap_or_else(|| self.module.add_function("lumen_action", fn_type, None))
+    }
+
+    /// DOM 的滚动写入：`void lumen_scroll(i32 y)`，把滚动距离（可选夹取后）写进数值单元。
+    fn build_dom_scroll_writer(&self, program: &UiProgram) -> Result<(), String> {
+        let Some((cell, bounds)) = scroll_action_cell(program) else {
+            return Ok(());
+        };
+        let cell = cell.to_string();
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let function = self.module.add_function(
+            "lumen_scroll",
+            self.context.void_type().fn_type(&[i32_type.into()], false),
+            None,
+        );
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+        let offset = function
+            .get_nth_param(0)
+            .ok_or("lumen_scroll offset parameter is missing")?
+            .into_int_value();
+        let mut value = self
+            .builder
+            .build_int_s_extend(offset, i64_type, "scroll_y")
+            .map_err(|error| error.to_string())?;
+        if let Some((low, high, shift)) = bounds {
+            if shift != 0 {
+                value = self
+                    .builder
+                    .build_int_add(
+                        value,
+                        i64_type.const_int((-shift) as u64, true),
+                        "scroll_shifted",
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            let above_low = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SGT,
+                    value,
+                    i64_type.const_int(low as u64, true),
+                    "scroll_above_low",
+                )
+                .map_err(|error| error.to_string())?;
+            let lowered = self
+                .builder
+                .build_select(
+                    above_low,
+                    value,
+                    i64_type.const_int(low as u64, true),
+                    "scroll_lower",
+                )
+                .map_err(|error| error.to_string())?
+                .into_int_value();
+            let below_high = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SLT,
+                    lowered,
+                    i64_type.const_int(high as u64, true),
+                    "scroll_below_high",
+                )
+                .map_err(|error| error.to_string())?;
+            value = self
+                .builder
+                .build_select(
+                    below_high,
+                    lowered,
+                    i64_type.const_int(high as u64, true),
+                    "scroll_clamped",
+                )
+                .map_err(|error| error.to_string())?
+                .into_int_value();
+        }
+        let text = self.view().dom_number_text(value)?;
+        self.store_cell_text(&cell, text, ptr_type.const_null())?;
+        self.builder
+            .build_return(None)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// DOM 的动作分发：`void lumen_action(i32 action, i32 row)`。
+    /// 每个 state action 的动作体在独立基本块里展开，按 action 编号 switch 进去。
+    fn build_dom_action_dispatch(&self, program: &UiProgram) -> Result<FunctionValue<'ctx>, String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let function = self.dom_action_declaration();
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+        let action = function
+            .get_nth_param(0)
+            .ok_or("lumen_action action parameter is missing")?
+            .into_int_value();
+        let row = function
+            .get_nth_param(1)
+            .ok_or("lumen_action row parameter is missing")?
+            .into_int_value();
+
+        let row_global = self.module.add_global(i64_type, None, "g_action_row");
+        row_global.set_initializer(&i64_type.const_zero());
+        let row = self
+            .builder
+            .build_int_z_extend(row, i64_type, "action_row")
+            .map_err(|error| error.to_string())?;
+        self.builder
+            .build_store(row_global.as_pointer_value(), row)
+            .map_err(|error| error.to_string())?;
+
+        if program.state_actions.is_empty() {
+            self.builder
+                .build_return(None)
+                .map_err(|error| error.to_string())?;
+        } else {
+            let noop = self.context.append_basic_block(function, "noop");
+            let cases: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = program
+                .state_actions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    (
+                        i32_type.const_int(index as u64, false),
+                        self.context
+                            .append_basic_block(function, &format!("action_{index}")),
+                    )
+                })
+                .collect();
+            self.builder
+                .build_switch(action, noop, &cases)
+                .map_err(|error| error.to_string())?;
+            for (index, (_, block)) in cases.iter().enumerate() {
+                self.builder.position_at_end(*block);
+                self.emit_state_mutation_body(
+                    &program.state_actions[index],
+                    index,
+                    ptr_type.const_null(),
+                    ptr_type.const_null(),
+                )?;
+                // 动作体可能把插入点挪到了新块（条件槽位/列表重建），
+                // 就在真正结束的那个块上收尾
+                self.builder
+                    .build_return(None)
+                    .map_err(|error| error.to_string())?;
+            }
+            self.builder.position_at_end(noop);
+            self.builder
+                .build_return(None)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(function)
+    }
+
     /// 把界面构建逻辑生成成独立函数 `void lumen_build_ui(id delegate)`。
     fn build_ui_function(&self, program: &UiProgram) -> Result<FunctionValue<'ctx>, String> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -4405,7 +4630,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             .ok_or("notification parameter is missing")?
             .into_pointer_value();
         let field = self
-            .send_msg_ptr(notification, self.get_selector("object")?, &[])?
+            .send_msg_ptr(notification, "object", &[])?
             .ok_or("NSNotification object returned void")?;
         let field_bits = self
             .builder
@@ -4505,8 +4730,17 @@ impl<'ctx> IosCodeGen<'ctx> {
         drop(cells);
 
         let event_target = Some(receiver);
+        // DOM 目标没有 UIKit 的「屏幕」：根视图直接按逻辑视口算，百分比宽度才落得对
+        let (root_width, root_height) = if self.view_kind == view_backend::Kind::Dom {
+            (
+                view_backend::DOM_VIEWPORT_WIDTH,
+                view_backend::DOM_VIEWPORT_HEIGHT,
+            )
+        } else {
+            (350.0, 700.0)
+        };
         let root_view = if let Some(node) = program.nodes.first() {
-            self.codegen_node(node, event_target, 0.0, 0.0, 350.0, 700.0, None, true)?
+            self.codegen_node(node, event_target, 0.0, 0.0, root_width, root_height, None, true)?
         } else {
             self.create_objc_instance_with_frame(self.view_class(), self.screen_bounds()?)?
         };
@@ -4887,9 +5121,18 @@ impl<'ctx> IosCodeGen<'ctx> {
 
     /// 行内按钮的 `tag` 就是行号。
     fn sender_row(&self, sender: PointerValue<'ctx>) -> Result<IntValue<'ctx>, String> {
-        self.send_msg_impl(
+        // DOM 目标没有「控件 tag」可读：行号由桥在点击时直接传进 lumen_action
+        if self.view_kind == view_backend::Kind::Dom {
+            let global = self.i64_global("g_action_row");
+            return Ok(self
+                .builder
+                .build_load(self.context.i64_type(), global.as_pointer_value(), "action_row")
+                .map_err(|error| error.to_string())?
+                .into_int_value());
+        }
+        self.send_msg_scalar(
             sender,
-            self.get_selector("tag")?,
+            "tag",
             &[],
             BasicTypeEnum::IntType(self.context.i64_type()),
         )?
@@ -4905,12 +5148,12 @@ impl<'ctx> IosCodeGen<'ctx> {
         global: GlobalValue<'ctx>,
     ) -> Result<(), String> {
         let anchor = self
-            .send_msg_ptr(view, self.get_selector("heightAnchor")?, &[])?
+            .send_msg_ptr(view, "heightAnchor", &[])?
             .ok_or_else(|| "heightAnchor returned void".to_string())?;
         let constraint = self
             .send_msg_ptr(
                 anchor,
-                self.get_selector("constraintEqualToConstant:")?,
+                "constraintEqualToConstant:",
                 &[self.context.f64_type().const_float(height).into()],
             )?
             .ok_or_else(|| "height constraint creation returned void".to_string())?;
@@ -5075,6 +5318,10 @@ impl<'ctx> IosCodeGen<'ctx> {
             .chars()
             .map(|ch| if ch.is_alphanumeric() { ch } else { '_' })
             .collect();
+        if self.view_kind == view_backend::Kind::Dom {
+            let text = self.view().dom_number_text(value)?;
+            return self.store_cell_text(cell, text, receiver);
+        }
         let buffer_type = self.context.i8_type().array_type(32);
         let name = format!("g_cell_number_buffer_{sanitized}");
         let buffer = match self.module.get_global(&name) {
@@ -5675,7 +5922,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             .into_pointer_value();
         // 一次消息把所有旧行摘掉（含 stack 的 arrangement）
         let subviews = self
-            .send_msg_ptr(container, self.get_selector("subviews")?, &[])?
+            .send_msg_ptr(container, "subviews", &[])?
             .ok_or("list subviews returned void")?;
         let remove = self.get_selector("removeFromSuperview")?;
         self.send_msg_void(subviews, "makeObjectsPerformSelector:", &[remove.into()])?;
@@ -6115,7 +6362,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 // UITextField 用 text，AppKit 的 NSTextField 用 stringValue
                 let selector = if self.is_mac() { "stringValue" } else { "text" };
                 let text = self
-                    .send_msg_ptr(sender, self.get_selector(selector)?, &[])?
+                    .send_msg_ptr(sender, selector, &[])?
                     .ok_or("text field text returned void")?;
                 // 控件返回的是 autoreleased 字符串，状态单元要自己持有一份
                 self.copy_nsstring(text)?
@@ -6143,9 +6390,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                     .map_err(|e| e.to_string())?
                     .into_pointer_value();
                 let current = self
-                    .send_msg_impl(
+                    .send_msg_scalar(
                         current,
-                        self.get_selector("longLongValue")?,
+                        "longLongValue",
                         &[],
                         BasicTypeEnum::IntType(self.context.i64_type()),
                     )?
@@ -6159,42 +6406,46 @@ impl<'ctx> IosCodeGen<'ctx> {
                         "state_next",
                     )
                     .map_err(|e| e.to_string())?;
-                let buffer_type = self.context.i8_type().array_type(32);
-                let buffer = self.module.add_global(
-                    buffer_type,
-                    None,
-                    &format!("g_state_text_buffer_{index}"),
-                );
-                buffer.set_initializer(&buffer_type.const_zero());
-                let format = self
-                    .builder
-                    .build_global_string_ptr("%lld", "state_format")
-                    .map_err(|e| e.to_string())?;
-                let snprintf_type = self.context.i32_type().fn_type(
-                    &[
-                        ptr_type.into(),
-                        self.context.i64_type().into(),
-                        ptr_type.into(),
-                    ],
-                    true,
-                );
-                let snprintf = self
-                    .module
-                    .get_function("snprintf")
-                    .unwrap_or_else(|| self.module.add_function("snprintf", snprintf_type, None));
-                self.builder
-                    .build_call(
-                        snprintf,
+                if self.view_kind == view_backend::Kind::Dom {
+                    self.view().dom_number_text(next)?
+                } else {
+                    let buffer_type = self.context.i8_type().array_type(32);
+                    let buffer = self.module.add_global(
+                        buffer_type,
+                        None,
+                        &format!("g_state_text_buffer_{index}"),
+                    );
+                    buffer.set_initializer(&buffer_type.const_zero());
+                    let format = self
+                        .builder
+                        .build_global_string_ptr("%lld", "state_format")
+                        .map_err(|e| e.to_string())?;
+                    let snprintf_type = self.context.i32_type().fn_type(
                         &[
-                            buffer.as_pointer_value().into(),
-                            self.context.i64_type().const_int(32, false).into(),
-                            format.as_pointer_value().into(),
-                            next.into(),
+                            ptr_type.into(),
+                            self.context.i64_type().into(),
+                            ptr_type.into(),
                         ],
-                        "formatted_state",
-                    )
-                    .map_err(|e| e.to_string())?;
-                self.create_nsstring_from_cstr(buffer.as_pointer_value())?
+                        true,
+                    );
+                    let snprintf = self
+                        .module
+                        .get_function("snprintf")
+                        .unwrap_or_else(|| self.module.add_function("snprintf", snprintf_type, None));
+                    self.builder
+                        .build_call(
+                            snprintf,
+                            &[
+                                buffer.as_pointer_value().into(),
+                                self.context.i64_type().const_int(32, false).into(),
+                                format.as_pointer_value().into(),
+                                next.into(),
+                            ],
+                            "formatted_state",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    self.create_nsstring_from_cstr(buffer.as_pointer_value())?
+                }
             }
             StateMutation::Noop
             | StateMutation::Sequence(_)
@@ -6246,12 +6497,12 @@ impl<'ctx> IosCodeGen<'ctx> {
             .ok_or("bounds callback parameter is missing")?
             .into_pointer_value();
         let clip = self
-            .send_msg_ptr(note, self.get_selector("object")?, &[])?
+            .send_msg_ptr(note, "object", &[])?
             .ok_or("NSNotification object returned void")?;
         let rect = self
-            .send_msg_impl(
+            .send_msg_scalar(
                 clip,
-                self.get_selector("bounds")?,
+                "bounds",
                 &[],
                 BasicTypeEnum::StructType(self.context.struct_type(
                     &[
@@ -6380,9 +6631,9 @@ impl<'ctx> IosCodeGen<'ctx> {
 
             self.builder.position_at_end(write_block);
             let offset = self
-                .send_msg_impl(
+                .send_msg_scalar(
                     sender,
-                    self.get_selector("contentOffset")?,
+                    "contentOffset",
                     &[],
                     BasicTypeEnum::StructType(self.context.struct_type(
                         &[self.context.f64_type().into(), self.context.f64_type().into()],
@@ -6397,9 +6648,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                 .map_err(|error| error.to_string())?
                 .into_float_value();
             let inset = self
-                .send_msg_impl(
+                .send_msg_scalar(
                     sender,
-                    self.get_selector("adjustedContentInset")?,
+                    "adjustedContentInset",
                     &[],
                     BasicTypeEnum::StructType(self.context.struct_type(
                         &[
@@ -6515,9 +6766,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                     .build_load(ptr_type, global.as_pointer_value(), "expr_cell")
                     .map_err(|e| e.to_string())?
                     .into_pointer_value();
-                self.send_msg_impl(
+                self.send_msg_scalar(
                     text,
-                    self.get_selector("longLongValue")?,
+                    "longLongValue",
                     &[],
                     BasicTypeEnum::IntType(self.context.i64_type()),
                 )?
@@ -6623,9 +6874,9 @@ impl<'ctx> IosCodeGen<'ctx> {
             .unwrap_or_default();
         if !opacity_views.is_empty() {
             let number = self
-                .send_msg_impl(
+                .send_msg_scalar(
                     value,
-                    self.get_selector("longLongValue")?,
+                    "longLongValue",
                     &[],
                     BasicTypeEnum::IntType(self.context.i64_type()),
                 )?
@@ -6685,6 +6936,21 @@ impl<'ctx> IosCodeGen<'ctx> {
         action: Option<usize>,
     ) -> Result<(), String> {
         if let Some(action) = action {
+            if self.view_kind == view_backend::Kind::Dom {
+                let function = self.dom_action_declaration();
+                let i32_type = self.context.i32_type();
+                self.builder
+                    .build_call(
+                        function,
+                        &[
+                            i32_type.const_int(action as u64, false).into(),
+                            i32_type.const_zero().into(),
+                        ],
+                        "",
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
             self.send_msg_void(
                 receiver,
                 &format!("stateAction{action}:"),
@@ -6762,9 +7028,9 @@ impl<'ctx> IosCodeGen<'ctx> {
             return Ok(());
         }
         let raw_state = self
-            .send_msg_impl(
+            .send_msg_scalar(
                 state_value,
-                self.get_selector("boolValue")?,
+                "boolValue",
                 &[],
                 BasicTypeEnum::IntType(self.context.i8_type()),
             )?
@@ -6956,12 +7222,12 @@ impl<'ctx> IosCodeGen<'ctx> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let window_class = self.get_class("NSWindow")?;
         let alloc = self
-            .send_msg_ptr(window_class, self.get_selector("alloc")?, &[])?
+            .send_msg_ptr(window_class, "alloc", &[])?
             .ok_or("NSWindow alloc returned void")?;
         let window = self
             .send_msg_ptr(
                 alloc,
-                self.get_selector("initWithContentRect:styleMask:backing:defer:")?,
+                "initWithContentRect:styleMask:backing:defer:",
                 &[
                     self.rect_constant(0.0, 0.0, 420.0, 900.0).into(),
                     // titled | closable | miniaturizable | resizable
@@ -6981,7 +7247,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         self.send_msg_void(window, "setTitle:", &[title.into()])?;
 
         let content_view = self
-            .send_msg_ptr(window, self.get_selector("contentView")?, &[])?
+            .send_msg_ptr(window, "contentView", &[])?
             .ok_or("NSWindow contentView returned void")?;
         let root_view = if let Some(node) = root_node {
             let global_view = self
@@ -7014,7 +7280,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         let app = self
             .send_msg_ptr(
                 self.get_class("NSApplication")?,
-                self.get_selector("sharedApplication")?,
+                "sharedApplication",
                 &[],
             )?
             .ok_or("NSApplication sharedApplication returned void")?;
@@ -7113,6 +7379,10 @@ impl<'ctx> IosCodeGen<'ctx> {
     }
 
     fn build_show_window_logic(&self, root_node: Option<&IRNode>) -> Result<(), String> {
+        // DOM 后端没有窗口/视图控制器：根节点由桥直接挂到 #root（见 dom.attach）
+        if self.view_kind == view_backend::Kind::Dom {
+            return Ok(());
+        }
         if self.is_mac() {
             return self.build_mac_window_logic(root_node);
         }
@@ -7130,7 +7400,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         let global_view = self.module.get_global("g_root_view").unwrap().as_pointer_value();
         let global_view_val = self.builder.build_load(ptr_type, global_view, "loaded_view").map_err(|e| e.to_string())?.into_pointer_value();
         let controller_view = self
-            .send_msg_ptr(view_controller, self.get_selector("view")?, &[])?
+            .send_msg_ptr(view_controller, "view", &[])?
             .ok_or("UIViewController view returned void")?;
         self.send_msg_void(
             controller_view,
@@ -7246,15 +7516,15 @@ impl<'ctx> IosCodeGen<'ctx> {
             ("topAnchor", "topAnchor"),
         ] {
             let view_anchor = self
-                .send_msg_ptr(view, self.get_selector(anchor_name)?, &[])?
+                .send_msg_ptr(view, anchor_name, &[])?
                 .ok_or_else(|| format!("root view {anchor_name} returned void"))?;
             let parent_anchor = self
-                .send_msg_ptr(parent, self.get_selector(parent_anchor_name)?, &[])?
+                .send_msg_ptr(parent, parent_anchor_name, &[])?
                 .ok_or_else(|| format!("controller view {parent_anchor_name} returned void"))?;
             let constraint = self
                 .send_msg_ptr(
                     view_anchor,
-                    self.get_selector("constraintEqualToAnchor:")?,
+                    "constraintEqualToAnchor:",
                     &[parent_anchor.into()],
                 )?
                 .ok_or_else(|| format!("root {anchor_name} constraint creation returned void"))?;
@@ -7282,15 +7552,15 @@ impl<'ctx> IosCodeGen<'ctx> {
             };
             if fills_parent {
                 let view_anchor = self
-                    .send_msg_ptr(view, self.get_selector(edge_anchor_name)?, &[])?
+                    .send_msg_ptr(view, edge_anchor_name, &[])?
                     .ok_or_else(|| format!("root view {edge_anchor_name} returned void"))?;
                 let parent_anchor = self
-                    .send_msg_ptr(parent, self.get_selector(edge_anchor_name)?, &[])?
+                    .send_msg_ptr(parent, edge_anchor_name, &[])?
                     .ok_or_else(|| format!("controller view {edge_anchor_name} returned void"))?;
                 let constraint = self
                     .send_msg_ptr(
                         view_anchor,
-                        self.get_selector("constraintEqualToAnchor:")?,
+                        "constraintEqualToAnchor:",
                         &[parent_anchor.into()],
                     )?
                     .ok_or_else(|| format!("root {edge_anchor_name} constraint creation returned void"))?;
@@ -7298,25 +7568,25 @@ impl<'ctx> IosCodeGen<'ctx> {
                 continue;
             }
             let view_anchor = self
-                .send_msg_ptr(view, self.get_selector(anchor_name)?, &[])?
+                .send_msg_ptr(view, anchor_name, &[])?
                 .ok_or_else(|| format!("root view {anchor_name} returned void"))?;
             let constraint = match dimension {
                 Some(Dimension::Points(value)) => self
                     .send_msg_ptr(
                         view_anchor,
-                        self.get_selector("constraintEqualToConstant:")?,
+                        "constraintEqualToConstant:",
                         &[self.context.f64_type().const_float(value).into()],
                     )?
                     .ok_or_else(|| format!("root {anchor_name} constant constraint returned void"))?,
                 Some(Dimension::Percent(fraction)) => {
                     let parent_anchor = self
-                        .send_msg_ptr(parent, self.get_selector(parent_anchor_name)?, &[])?
+                        .send_msg_ptr(parent, parent_anchor_name, &[])?
                         .ok_or_else(|| {
                             format!("controller view {parent_anchor_name} returned void")
                         })?;
                     self.send_msg_ptr(
                         view_anchor,
-                        self.get_selector("constraintEqualToAnchor:multiplier:")?,
+                        "constraintEqualToAnchor:multiplier:",
                         &[
                             parent_anchor.into(),
                             self.context.f64_type().const_float(fraction).into(),
@@ -7360,12 +7630,12 @@ impl<'ctx> IosCodeGen<'ctx> {
             ("heightAnchor", layout.height),
         ] {
             let anchor = self
-                .send_msg_ptr(child, self.get_selector(anchor_name)?, &[])?
+                .send_msg_ptr(child, anchor_name, &[])?
                 .ok_or_else(|| format!("child {anchor_name} returned void"))?;
             let constraint = self
                 .send_msg_ptr(
                     anchor,
-                    self.get_selector("constraintEqualToConstant:")?,
+                    "constraintEqualToConstant:",
                     &[self.context.f64_type().const_float(size).into()],
                 )?
                 .ok_or_else(|| format!("child {anchor_name} constraint returned void"))?;
@@ -7380,15 +7650,15 @@ impl<'ctx> IosCodeGen<'ctx> {
                 continue;
             };
             let child_anchor = self
-                .send_msg_ptr(child, self.get_selector(anchor_name)?, &[])?
+                .send_msg_ptr(child, anchor_name, &[])?
                 .ok_or_else(|| format!("child {anchor_name} returned void"))?;
             let parent_anchor = self
-                .send_msg_ptr(parent, self.get_selector(anchor_name)?, &[])?
+                .send_msg_ptr(parent, anchor_name, &[])?
                 .ok_or_else(|| format!("parent {anchor_name} returned void"))?;
             let constraint = self
                 .send_msg_ptr(
                     child_anchor,
-                    self.get_selector("constraintEqualToAnchor:constant:")?,
+                    "constraintEqualToAnchor:constant:",
                     &[
                         parent_anchor.into(),
                         self.context.f64_type().const_float(constant).into(),
@@ -7409,15 +7679,15 @@ impl<'ctx> IosCodeGen<'ctx> {
         constant: inkwell::values::FloatValue<'ctx>,
     ) -> Result<(), String> {
         let child_anchor = self
-            .send_msg_ptr(child, self.get_selector(child_anchor_name)?, &[])?
+            .send_msg_ptr(child, child_anchor_name, &[])?
             .ok_or_else(|| format!("{child_anchor_name} returned void"))?;
         let parent_anchor = self
-            .send_msg_ptr(parent, self.get_selector(parent_anchor_name)?, &[])?
+            .send_msg_ptr(parent, parent_anchor_name, &[])?
             .ok_or_else(|| format!("{parent_anchor_name} returned void"))?;
         let constraint = self
             .send_msg_ptr(
                 child_anchor,
-                self.get_selector("constraintEqualToAnchor:constant:")?,
+                "constraintEqualToAnchor:constant:",
                 &[parent_anchor.into(), constant.into()],
             )?
             .ok_or_else(|| format!("{child_anchor_name} constraint creation returned void"))?;
@@ -7433,15 +7703,15 @@ impl<'ctx> IosCodeGen<'ctx> {
         constant: f64,
     ) -> Result<(), String> {
         let child_anchor = self
-            .send_msg_ptr(child, self.get_selector(child_anchor_name)?, &[])?
+            .send_msg_ptr(child, child_anchor_name, &[])?
             .ok_or_else(|| format!("{child_anchor_name} returned void"))?;
         let parent_anchor = self
-            .send_msg_ptr(parent, self.get_selector(parent_anchor_name)?, &[])?
+            .send_msg_ptr(parent, parent_anchor_name, &[])?
             .ok_or_else(|| format!("{parent_anchor_name} returned void"))?;
         let constraint = self
             .send_msg_ptr(
                 child_anchor,
-                self.get_selector("constraintEqualToAnchor:constant:")?,
+                "constraintEqualToAnchor:constant:",
                 &[
                     parent_anchor.into(),
                     self.context.f64_type().const_float(constant).into(),
@@ -7453,7 +7723,7 @@ impl<'ctx> IosCodeGen<'ctx> {
 
     /// 父视图的安全区布局参考，编译期坐标以它为原点。
     fn safe_area_guide(&self, view: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, String> {
-        self.send_msg_ptr(view, self.get_selector("safeAreaLayoutGuide")?, &[])?
+        self.send_msg_ptr(view, "safeAreaLayoutGuide", &[])?
             .ok_or_else(|| "UIView safeAreaLayoutGuide returned void".into())
     }
 
@@ -7484,12 +7754,12 @@ impl<'ctx> IosCodeGen<'ctx> {
         size: f64,
     ) -> Result<(), String> {
         let anchor = self
-            .send_msg_ptr(view, self.get_selector(anchor_name)?, &[])?
+            .send_msg_ptr(view, anchor_name, &[])?
             .ok_or_else(|| format!("{anchor_name} returned void"))?;
         let constraint = self
             .send_msg_ptr(
                 anchor,
-                self.get_selector("constraintEqualToConstant:")?,
+                "constraintEqualToConstant:",
                 &[self.context.f64_type().const_float(size).into()],
             )?
             .ok_or_else(|| format!("{anchor_name} constraint creation returned void"))?;
@@ -7512,15 +7782,15 @@ impl<'ctx> IosCodeGen<'ctx> {
             padding.vertical()
         };
         let view_anchor = self
-            .send_msg_ptr(view, self.get_selector(anchor_name)?, &[])?
+            .send_msg_ptr(view, anchor_name, &[])?
             .ok_or_else(|| format!("{anchor_name} returned void"))?;
         let parent_anchor = self
-            .send_msg_ptr(parent, self.get_selector(parent_anchor_name)?, &[])?
+            .send_msg_ptr(parent, parent_anchor_name, &[])?
             .ok_or_else(|| format!("{parent_anchor_name} returned void"))?;
         let constraint = self
             .send_msg_ptr(
                 view_anchor,
-                self.get_selector("constraintEqualToAnchor:multiplier:constant:")?,
+                "constraintEqualToAnchor:multiplier:constant:",
                 &[
                     parent_anchor.into(),
                     self.context.f64_type().const_float(fraction).into(),
@@ -7587,7 +7857,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         )?;
         if node_image_mode(child_node) == Some(ImageMode::WidthFix) {
             let image = self
-                .send_msg_ptr(child, self.get_selector("image")?, &[])?
+                .send_msg_ptr(child, "image", &[])?
                 .ok_or("UIImageView image returned void")?;
             self.add_image_aspect_constraint(child, image)?;
         } else if !node_uses_intrinsic_dimension(child_node, true) {
@@ -7604,9 +7874,9 @@ impl<'ctx> IosCodeGen<'ctx> {
         let f64_type = self.context.f64_type();
         let size_type = self.context.struct_type(&[f64_type.into(), f64_type.into()], false);
         let size = self
-            .send_msg_impl(
+            .send_msg_scalar(
                 image,
-                self.get_selector("size")?,
+                "size",
                 &[],
                 BasicTypeEnum::StructType(size_type),
             )?
@@ -7627,15 +7897,15 @@ impl<'ctx> IosCodeGen<'ctx> {
             .build_float_div(image_width, image_height, "image_aspect_ratio")
             .map_err(|error| error.to_string())?;
         let width_anchor = self
-            .send_msg_ptr(image_view, self.get_selector("widthAnchor")?, &[])?
+            .send_msg_ptr(image_view, "widthAnchor", &[])?
             .ok_or("UIImageView widthAnchor returned void")?;
         let height_anchor = self
-            .send_msg_ptr(image_view, self.get_selector("heightAnchor")?, &[])?
+            .send_msg_ptr(image_view, "heightAnchor", &[])?
             .ok_or("UIImageView heightAnchor returned void")?;
         let constraint = self
             .send_msg_ptr(
                 width_anchor,
-                self.get_selector("constraintEqualToAnchor:multiplier:")?,
+                "constraintEqualToAnchor:multiplier:",
                 &[height_anchor.into(), aspect_ratio.into()],
             )?
             .ok_or("UIImageView aspect-ratio constraint returned void")?;
@@ -8071,7 +8341,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             if matches!(image_mode, Some(ImageMode::WidthFix | ImageMode::HeightFix)) {
                 let image = match child_node {
                     IRNode::Image { source: _, mode: _, style: _ } => self
-                        .send_msg_ptr(*child, self.get_selector("image")?, &[])?
+                        .send_msg_ptr(*child, "image", &[])?
                         .ok_or("UIImageView image returned void")?,
                     _ => unreachable!("only image nodes have image sizing modes"),
                 };
@@ -8406,7 +8676,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         if style.border_radius.is_some() {
             self.wants_layer(scroll_view)?;
             let layer = self
-                .send_msg_ptr(scroll_view, self.get_selector("layer")?, &[])?
+                .send_msg_ptr(scroll_view, "layer", &[])?
                 .ok_or("NSScrollView layer returned void")?;
             self.send_msg_void(layer, "setMasksToBounds:", &[self.context.i8_type().const_int(1, false).into()])?;
         }
@@ -8422,7 +8692,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         )?;
         self.send_msg_void(scroll_view, "setDocumentView:", &[document.into()])?;
         let clip_view = self
-            .send_msg_ptr(scroll_view, self.get_selector("contentView")?, &[])?
+            .send_msg_ptr(scroll_view, "contentView", &[])?
             .ok_or("NSScrollView contentView returned void")?;
         self.add_anchor_constraint(document, "leadingAnchor", clip_view, "leadingAnchor", 0.0)?;
         self.add_anchor_constraint(document, "trailingAnchor", clip_view, "trailingAnchor", 0.0)?;
@@ -8458,7 +8728,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             let centre = self
                 .send_msg_ptr(
                     self.get_class("NSNotificationCenter")?,
-                    self.get_selector("defaultCenter")?,
+                    "defaultCenter",
                     &[],
                 )?
                 .ok_or("NSNotificationCenter defaultCenter returned void")?;
@@ -8557,10 +8827,10 @@ impl<'ctx> IosCodeGen<'ctx> {
         self.send_msg_void(scroll_view, "addSubview:", &[content_stack.into()])?;
 
         let content_guide = self
-            .send_msg_ptr(scroll_view, self.get_selector("contentLayoutGuide")?, &[])?
+            .send_msg_ptr(scroll_view, "contentLayoutGuide", &[])?
             .ok_or("UIScrollView contentLayoutGuide returned void")?;
         let frame_guide = self
-            .send_msg_ptr(scroll_view, self.get_selector("frameLayoutGuide")?, &[])?
+            .send_msg_ptr(scroll_view, "frameLayoutGuide", &[])?
             .ok_or("UIScrollView frameLayoutGuide returned void")?;
         self.add_anchor_constraint(
             content_stack,
@@ -8780,12 +9050,12 @@ impl<'ctx> IosCodeGen<'ctx> {
                     .unwrap_or_else(|| node_height(when_true, available_height));
                 let visible = *initial;
                 let height_constraint = self
-                    .send_msg_ptr(slot, self.get_selector("heightAnchor")?, &[])?
+                    .send_msg_ptr(slot, "heightAnchor", &[])?
                     .ok_or("slot heightAnchor returned void")?;
                 let height_constraint = self
                     .send_msg_ptr(
                         height_constraint,
-                        self.get_selector("constraintEqualToConstant:")?,
+                        "constraintEqualToConstant:",
                         &[self
                             .context
                             .f64_type()
@@ -9025,9 +9295,14 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let scroll_view = self.create_objc_instance_with_frame(self.scroll_class(), frame)?;
                 self.apply_inline_style(scroll_view, style, false)?;
                 if style.scroll_action.is_some() {
+                    if self.view_kind == view_backend::Kind::Dom {
+                        self.view()
+                            .dom_scroll_callback(scroll_view, style.scroll_action.unwrap_or(0))?;
+                    } else {
                     let target =
                         event_target.ok_or("ScrollView onScroll requires an event target")?;
                     self.send_msg_void(scroll_view, "setDelegate:", &[target.into()])?;
+                    }
                     let global = self.object_global("g_scroll_action_view");
                     self.builder
                         .build_store(global.as_pointer_value(), scroll_view)
@@ -9158,18 +9433,15 @@ impl<'ctx> IosCodeGen<'ctx> {
                 }
                 let image_name = self.create_nsstring(source)?;
                 let image_class = self.get_class(if self.is_mac() { "NSImage" } else { "UIImage" })?;
-                let image_named = self.get_selector("imageNamed:")?;
                 let image = self
-                    .send_msg_ptr(image_class, image_named, &[image_name.into()])?
+                    .send_msg_ptr(image_class, "imageNamed:", &[image_name.into()])?
                     .ok_or("UIImage imageNamed: returned void")?;
                 let image_view_class = self.get_class(self.image_view_class())?;
-                let alloc = self.get_selector("alloc")?;
                 let image_view = self
-                    .send_msg_ptr(image_view_class, alloc, &[])?
+                    .send_msg_ptr(image_view_class, "alloc", &[])?
                     .ok_or("UIImageView alloc returned void")?;
-                let init_with_image = self.get_selector("initWithImage:")?;
                 let image_view = self
-                    .send_msg_ptr(image_view, init_with_image, &[image.into()])?
+                    .send_msg_ptr(image_view, "initWithImage:", &[image.into()])?
                     .ok_or("UIImageView initWithImage: returned void")?;
                 let frame = self.rect_constant(
                     x,
@@ -9274,7 +9546,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 }
                 if let Some(action_index) = on_input.filter(|_| !self.is_mac()) {
                     let target = event_target.ok_or("Input onInput requires an event target")?;
-                    let action = self.get_selector(&format!("stateAction{action_index}:"))?;
+                    let action = self.view().action_handle(action_index);
                     self.send_msg_void(
                         input,
                         "addTarget:action:forControlEvents:",
@@ -9287,7 +9559,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 }
                 if let Some(action_index) = on_focus.filter(|_| !self.is_mac()) {
                     let target = event_target.ok_or("Input onFocus requires an event target")?;
-                    let action = self.get_selector(&format!("stateAction{action_index}:"))?;
+                    let action = self.view().action_handle(action_index);
                     self.send_msg_void(
                         input,
                         "addTarget:action:forControlEvents:",
@@ -9364,9 +9636,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                 )?;
                 let expected = self.create_nsstring("true")?;
                 let is_true = self
-                    .send_msg_impl(
+                    .send_msg_scalar(
                         value,
-                        self.get_selector("isEqualToString:")?,
+                        "isEqualToString:",
                         &[expected.into()],
                         BasicTypeEnum::IntType(self.context.bool_type()),
                     )?
@@ -9463,10 +9735,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                     self.create_objc_instance_with_frame(self.button_class(), self.rect_constant(x, y, 0.0, 0.0))?
                 } else {
                     let class = self.get_class(self.button_class())?;
-                    let button_type = self.get_selector("buttonWithType:")?;
                     self.send_msg_ptr(
                         class,
-                        button_type,
+                        "buttonWithType:",
                         &[self.context.i64_type().const_int(0, false).into()],
                     )?
                     .ok_or("UIButton buttonWithType: returned void")?
@@ -9530,11 +9801,10 @@ impl<'ctx> IosCodeGen<'ctx> {
                 }
                 if let Some(font_size) = style.font_size {
                     let font_class = self.get_class(if self.is_mac() { "NSFont" } else { "UIFont" })?;
-                    let system_font_sel = self.get_selector("systemFontOfSize:")?;
                     let font = self
                         .send_msg_ptr(
                             font_class,
-                            system_font_sel,
+                            "systemFontOfSize:",
                             &[self.context.f64_type().const_float(font_size).into()],
                         )?
                         .ok_or("systemFontOfSize: returned void")?;
@@ -9542,7 +9812,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                         self.send_msg_void(button, "setFont:", &[font.into()])?;
                     } else {
                         let title_label = self
-                            .send_msg_ptr(button, self.get_selector("titleLabel")?, &[])?
+                            .send_msg_ptr(button, "titleLabel", &[])?
                             .ok_or("UIButton titleLabel returned void")?;
                         self.send_msg_void(title_label, "setFont:", &[font.into()])?;
                     }
@@ -9552,7 +9822,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                     let target = event_target.ok_or(
                         "Button onClick requires a state(...) declaration",
                     )?;
-                    let action = self.get_selector(&format!("stateAction{action_index}:"))?;
+                    let action = self.view().action_handle(*action_index);
                     if self.is_mac() {
                         self.send_msg_void(button, "setTarget:", &[target.into()])?;
                         self.send_msg_void(button, "setAction:", &[action.into()])?;
@@ -9604,18 +9874,18 @@ impl<'ctx> IosCodeGen<'ctx> {
         let attributes = self
             .send_msg_ptr(
                 dictionary_class,
-                self.get_selector("dictionaryWithObject:forKey:")?,
+                "dictionaryWithObject:forKey:",
                 &[color.into(), key.into()],
             )?
             .ok_or("NSDictionary dictionaryWithObject:forKey: returned void")?;
         let attributed_class = self.get_class("NSAttributedString")?;
         let alloc = self
-            .send_msg_ptr(attributed_class, self.get_selector("alloc")?, &[])?
+            .send_msg_ptr(attributed_class, "alloc", &[])?
             .ok_or("NSAttributedString alloc returned void")?;
         let attributed = self
             .send_msg_ptr(
                 alloc,
-                self.get_selector("initWithString:attributes:")?,
+                "initWithString:attributes:",
                 &[string.into(), attributes.into()],
             )?
             .ok_or("NSAttributedString initWithString:attributes: returned void")?;
@@ -9696,10 +9966,10 @@ impl<'ctx> IosCodeGen<'ctx> {
         }
         self.wants_layer(view)?;
         let layer = self
-            .send_msg_ptr(view, self.get_selector("layer")?, &[])?
+            .send_msg_ptr(view, "layer", &[])?
             .ok_or("NSView layer returned void")?;
         let cg_color = self
-            .send_msg_ptr(color, self.get_selector("CGColor")?, &[])?
+            .send_msg_ptr(color, "CGColor", &[])?
             .ok_or("NSColor CGColor returned void")?;
         self.send_msg_void(layer, "setBackgroundColor:", &[cg_color.into()])
     }
@@ -9761,7 +10031,7 @@ impl<'ctx> IosCodeGen<'ctx> {
         if style.border_width.is_some() || style.border_color.is_some() || style.border_radius.is_some() {
             self.wants_layer(view)?;
             let layer = self
-                .send_msg_ptr(view, self.get_selector("layer")?, &[])?
+                .send_msg_ptr(view, "layer", &[])?
                 .ok_or("UIView layer returned void")?;
             if let Some(width) = style.border_width {
                 self.send_msg_void(
@@ -9773,7 +10043,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             if let Some(color_value) = &style.border_color {
                 let color = self.ui_color(color_value)?;
                 let cg_color = self
-                    .send_msg_ptr(color, self.get_selector("CGColor")?, &[])?
+                    .send_msg_ptr(color, "CGColor", &[])?
                     .ok_or("UIColor CGColor returned void")?;
                 self.send_msg_void(layer, "setBorderColor:", &[cg_color.into()])?;
             }
@@ -9804,11 +10074,10 @@ impl<'ctx> IosCodeGen<'ctx> {
         }
         if let Some(font_size) = style.font_size {
             let font_class = self.get_class(if self.is_mac() { "NSFont" } else { "UIFont" })?;
-            let system_font = self.get_selector("systemFontOfSize:")?;
             let font = self
                 .send_msg_ptr(
                     font_class,
-                    system_font,
+                    "systemFontOfSize:",
                     &[self.context.f64_type().const_float(font_size).into()],
                 )?
                 .ok_or("systemFontOfSize: returned void")?;
@@ -9856,11 +10125,10 @@ impl<'ctx> IosCodeGen<'ctx> {
     fn ui_color(&self, value: &str) -> Result<PointerValue<'ctx>, String> {
         if let Some((red, green, blue, alpha)) = parse_functional_color(value)? {
             let color_class = self.get_class(if self.is_mac() { "NSColor" } else { "UIColor" })?;
-            let selector = self.get_selector("colorWithRed:green:blue:alpha:")?;
             return self
                 .send_msg_ptr(
                     color_class,
-                    selector,
+                    "colorWithRed:green:blue:alpha:",
                     &[
                         self.context.f64_type().const_float(red).into(),
                         self.context.f64_type().const_float(green).into(),
@@ -9881,21 +10149,13 @@ impl<'ctx> IosCodeGen<'ctx> {
             _ => return Err(format!("unsupported inline color: {value}")),
         };
         let color_class = self.get_class(if self.is_mac() { "NSColor" } else { "UIColor" })?;
-        let selector = self.get_selector(selector_name)?;
-        self.send_msg_ptr(color_class, selector, &[])?
+        self.send_msg_ptr(color_class, selector_name, &[])?
             .ok_or_else(|| format!("UIColor {selector_name} returned void"))
     }
 
     /// 生成 [[Class alloc] init]，返回实例指针
     fn create_objc_instance(&self, class_name: &str) -> Result<PointerValue<'ctx>, String> {
-        let class = self.get_class(class_name)?;
-        let alloc_sel = self.get_selector("alloc")?;
-        let instance = self
-            .send_msg_ptr(class, alloc_sel, &[])?
-            .ok_or("alloc returned void")?;
-        let init_sel = self.get_selector("init")?;
-        self.send_msg_ptr(instance, init_sel, &[])?
-            .ok_or("init returned void".into())
+        self.view().new_object(class_name)
     }
 
     fn create_objc_instance_with_frame(
@@ -9903,26 +10163,26 @@ impl<'ctx> IosCodeGen<'ctx> {
         class_name: &str,
         frame: inkwell::values::StructValue<'ctx>,
     ) -> Result<PointerValue<'ctx>, String> {
-        let class = self.get_class(class_name)?;
-        let alloc_sel = self.get_selector("alloc")?;
-        let instance = self
-            .send_msg_ptr(class, alloc_sel, &[])?
-            .ok_or("alloc returned void")?;
-        let init_frame_sel = self.get_selector("initWithFrame:")?;
-        self.send_msg_ptr(instance, init_frame_sel, &[frame.into()])?
-            .ok_or_else(|| format!("{class_name} initWithFrame: returned void"))
+        self.view().new_view(class_name, frame)
     }
 
     fn screen_bounds(&self) -> Result<inkwell::values::StructValue<'ctx>, String> {
+        // DOM 后端：视口在编译期是固定的逻辑尺寸，布局按它算 frame
+        if self.view().is_dom() {
+            return Ok(self.rect_constant(
+                0.0,
+                0.0,
+                view_backend::DOM_VIEWPORT_WIDTH,
+                view_backend::DOM_VIEWPORT_HEIGHT,
+            ));
+        }
         if self.is_mac() {
             return Ok(self.rect_constant(0.0, 0.0, 420.0, 900.0));
         }
         let screen_class = self.get_class("UIScreen")?;
-        let main_screen_sel = self.get_selector("mainScreen")?;
         let screen = self
-            .send_msg_ptr(screen_class, main_screen_sel, &[])?
+            .send_msg_ptr(screen_class, "mainScreen", &[])?
             .ok_or("UIScreen mainScreen returned void")?;
-        let bounds_sel = self.get_selector("bounds")?;
 
         let f64_type = self.context.f64_type();
         let point_type = self
@@ -9935,9 +10195,9 @@ impl<'ctx> IosCodeGen<'ctx> {
             .context
             .struct_type(&[point_type.into(), size_type.into()], false);
         let result = self
-            .send_msg_impl(
+            .send_msg_scalar(
                 screen,
-                bounds_sel,
+                "bounds",
                 &[],
                 BasicTypeEnum::StructType(rect_type),
             )?
@@ -10006,12 +10266,10 @@ impl<'ctx> IosCodeGen<'ctx> {
         cstr: PointerValue<'ctx>,
     ) -> Result<PointerValue<'ctx>, String> {
         let cls = self.get_class("NSString")?;
-        let alloc_sel = self.get_selector("alloc")?;
         let raw = self
-            .send_msg_ptr(cls, alloc_sel, &[])?
+            .send_msg_ptr(cls, "alloc", &[])?
             .ok_or("NSString alloc returned void")?;
-        let init_sel = self.get_selector("initWithUTF8String:")?;
-        self.send_msg_ptr(raw, init_sel, &[cstr.into()])?
+        self.send_msg_ptr(raw, "initWithUTF8String:", &[cstr.into()])?
             .ok_or("initWithUTF8String returned void".into())
     }
 
@@ -10020,157 +10278,49 @@ impl<'ctx> IosCodeGen<'ctx> {
     fn copy_nsstring(&self, text: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, String> {
         let cls = self.get_class("NSString")?;
         let raw = self
-            .send_msg_ptr(cls, self.get_selector("alloc")?, &[])?
+            .send_msg_ptr(cls, "alloc", &[])?
             .ok_or("NSString alloc returned void")?;
-        self.send_msg_ptr(raw, self.get_selector("initWithString:")?, &[text.into()])?
+        self.send_msg_ptr(raw, "initWithString:", &[text.into()])?
             .ok_or("initWithString: returned void".into())
     }
 
     fn get_class(&self, name: &str) -> Result<PointerValue<'ctx>, String> {
-        let name_ptr = self
-            .builder
-            .build_global_string_ptr(name, "class_name")
-            .map_err(|e| e.to_string())?;
-        let call = self
-            .builder
-            .build_call(
-                self.objc_get_class,
-                &[name_ptr.as_pointer_value().into()],
-                "cls",
-            )
-            .map_err(|e| e.to_string())?;
-        match call.try_as_basic_value() {
-            inkwell::values::ValueKind::Basic(bv) => Ok(bv.into_pointer_value()),
-            inkwell::values::ValueKind::Instruction(_) => {
-                Err("Expected BasicValue, got Instruction".into())
-            }
-        }
+        self.view().class_handle(name)
     }
 
     fn get_selector(&self, name: &str) -> Result<PointerValue<'ctx>, String> {
-        let name_ptr = self
-            .builder
-            .build_global_string_ptr(name, "sel_name")
-            .map_err(|e| e.to_string())?;
-        let call = self
-            .builder
-            .build_call(
-                self.sel_register_name,
-                &[name_ptr.as_pointer_value().into()],
-                "sel",
-            )
-            .map_err(|e| e.to_string())?;
-        match call.try_as_basic_value() {
-            inkwell::values::ValueKind::Basic(bv) => Ok(bv.into_pointer_value()),
-            inkwell::values::ValueKind::Instruction(_) => {
-                Err("sel_registerName returned void".into())
-            }
-        }
-    }
-
-    fn metadata_type(
-        value: &BasicMetadataValueEnum<'ctx>,
-    ) -> Result<BasicMetadataTypeEnum<'ctx>, String> {
-        match value {
-            BasicMetadataValueEnum::IntValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::FloatValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::PointerValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::StructValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::ArrayValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::VectorValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::ScalableVectorValue(v) => Ok(v.get_type().into()),
-            BasicMetadataValueEnum::MetadataValue(_) => {
-                Err("Metadata values cannot be passed as function arguments".into())
-            }
-        }
+        self.view().selector_handle(name)
     }
 
     /// 发送消息，期望返回 id（指针）
     fn send_msg_ptr(
         &self,
         receiver: PointerValue<'ctx>,
-        selector: PointerValue<'ctx>,
+        selector: &str,
         args: &[BasicMetadataValueEnum<'ctx>],
     ) -> Result<Option<PointerValue<'ctx>>, String> {
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-        let call = self.send_msg_impl(
-            receiver,
-            selector,
-            args,
-            BasicTypeEnum::PointerType(ptr_type),
-        )?;
-        Ok(call.map(|v| v.into_pointer_value()))
+        self.view().call_ref(receiver, selector, args)
     }
 
     /// 发送消息，返回 void（如 setText:、addSubview:）
-fn send_msg_void(
-    &self,
-    receiver: PointerValue<'ctx>,
-    selector_name: &str,
-    args: &[BasicMetadataValueEnum<'ctx>],
-) -> Result<(), String> {
-    let selector = self.get_selector(selector_name)?;
-    let void_type = self.context.void_type();
-
-    // 构造 void 返回类型的函数签名
-    let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = vec![
-        self.context.ptr_type(AddressSpace::default()).into(),
-        self.context.ptr_type(AddressSpace::default()).into(),
-    ];
-    for a in args {
-        param_types.push(Self::metadata_type(a)?);
-    }
-    let fn_type = void_type.fn_type(&param_types, false);
-
-    let msg_send_ptr = self.objc_msg_send.as_global_value().as_pointer_value();
-    let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![receiver.into(), selector.into()];
-    call_args.extend(args.iter().cloned());
-
-    self.builder
-        .build_indirect_call(fn_type, msg_send_ptr, &call_args, "")
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-    /// 根据实际参数类型调用 objc_msgSend。
-    fn send_msg_impl(
+    fn send_msg_void(
         &self,
         receiver: PointerValue<'ctx>,
-        selector: PointerValue<'ctx>,
+        selector: &str,
+        args: &[BasicMetadataValueEnum<'ctx>],
+    ) -> Result<(), String> {
+        self.view().call_void(receiver, selector, args)
+    }
+
+    /// 发送消息，返回值是标量（BOOL / long 之类）。
+    fn send_msg_scalar(
+        &self,
+        receiver: PointerValue<'ctx>,
+        selector: &str,
         args: &[BasicMetadataValueEnum<'ctx>],
         return_type: BasicTypeEnum<'ctx>,
     ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
-        let ptr_type = self.context.ptr_type(AddressSpace::default());
-
-        // 1. 构造目标函数类型
-        let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> =
-            vec![ptr_type.into(), ptr_type.into()];
-        for a in args {
-            param_types.push(Self::metadata_type(a)?);
-        }
-        let fn_type = return_type.fn_type(&param_types, false);
-
-        // 2. 在 opaque pointer 模型下，调用时传入函数类型即可。
-        let msg_send_ptr = self.objc_msg_send.as_global_value().as_pointer_value();
-
-        // 3. 准备调用参数
-        let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
-            vec![receiver.into(), selector.into()];
-        call_args.extend(args.iter().cloned());
-
-        // 4. 使用函数指针和签名构建间接调用。
-           let call = self
-            .builder
-            .build_indirect_call(fn_type, msg_send_ptr, &call_args, "msg_result")
-            .map_err(|e| e.to_string())?;
-
-        // 5. 处理返回值（不依赖 ValueKind，直接通过 BasicValueEnum 匹配）
-        match call.try_as_basic_value() {
-            // 注意：这里用完全限定名匹配，如果依然报错，可以尝试直接匹配 Basic 和 Instruction 变体
-            inkwell::values::ValueKind::Basic(bv) => Ok(Some(bv)),
-            inkwell::values::ValueKind::Instruction(_) => Ok(None),
-        }
+        self.view().call_scalar(receiver, selector, args, return_type)
     }
 }
 
@@ -11396,6 +11546,47 @@ mod tests {
         );
 
         assert_eq!(layouts[0].x, 110.0);
+    }
+
+    #[test]
+    fn wasm_backend_emits_dom_imports_instead_of_objc() {
+        let program = parse_tsx_to_ast(
+            r#"function App() {
+                const rows = state([
+                    { id: 1, label: "a" },
+                    { id: 2, label: "b" }
+                ]);
+                const offset = state(0);
+                return <View style={{ padding: 16, backgroundColor: "white" }}>
+                    <Text>{rows.length}</Text>
+                    <ScrollView style={{ height: 200 }} onScroll={(y) => offset = clamp(y, 0, 100)}>
+                        {rows.map((item, index) => (
+                            <View style={{ height: 36 }}>
+                                <Text>{item.label}</Text>
+                                <Button onClick={() => rows.removeAt(index)}>删除</Button>
+                            </View>
+                        ))}
+                    </ScrollView>
+                </View>;
+            }"#,
+        );
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+
+        let context = Context::create();
+        let mut codegen = IosCodeGen::new_for(&context, Platform::Wasm);
+        codegen.generate(&program).unwrap();
+        let ir = codegen.module.print_to_string().to_string();
+
+        // 视图调用全部走 dom.* import，不再有 objc_msgSend
+        assert!(ir.contains("declare i32 @dom.initView("), "{ir}");
+        assert!(ir.contains("declare void @dom.addChild("), "{ir}");
+        assert!(ir.contains("declare void @dom.setText("), "{ir}");
+        assert!(!ir.contains("objc_msgSend"), "wasm 目标不该再发 objc 消息");
+        // 交互入口：点击与滚动各一个导出
+        assert!(ir.contains("define void @lumen_action("), "{ir}");
+        assert!(ir.contains("define void @lumen_scroll("), "{ir}");
+        // 数字单元走桥的 numberText，不依赖 snprintf 的 varargs 约定
+        assert!(ir.contains("declare i32 @dom.numberText(i64)"), "{ir}");
     }
 
     #[test]

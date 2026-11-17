@@ -442,6 +442,54 @@ const offset = state(0);
 - 顺手修掉一个 Android 侧的真坑：绑定的视图句柄必须存 **global ref**，存 local ref 的话
   native 调用返回后句柄失效，滚动时会直接 SIGSEGV（`lumen_refresh_N` 里踩过）。
 
+## 平台后端：Wasm（DOM 桥）
+
+同一个 IR 也能编到 wasm32，视图调用落到浏览器里的一组 `dom.*` import 上。它和 iOS / macOS
+共用同一份代码生成，差别被收在 `src/view_backend.rs` 的三条入口里：
+
+| 入口 | Objective-C（iOS / macOS） | DOM（wasm） |
+| --- | --- | --- |
+| `new_object` / `new_view` | `[[Class alloc] init…]` | `dom.class` → `dom.alloc` → `dom.initView` |
+| `call_ref`（取值消息） | `objc_msgSend` | 按映射表翻成 `dom.*`，返回 i32 句柄 |
+| `call_void`（置值消息） | `objc_msgSend` | 按映射表翻成 `dom.*` |
+
+映射表就在同一个文件的 `ROUTES` 里，登记了 objc 选择器 → 桥操作（含每个实参怎么翻译：
+句柄 / C 字符串 / f64 / CGRect / UIEdgeInsets / 忽略）。**表里没有的选择器直接编译失败**，
+不会生成一个链得出来但什么都不画的产物；表里登记成「忽略」的是 Auto Layout 约束那一族——
+DOM 侧用编译期算好的 frame 绝对定位，不重复跑一遍约束系统。
+
+布局约定：
+
+- 每个节点的 `frame` 落成 `position:absolute` 的 `left/top/width/height`；
+- `addArrangedSubview:`（UIStackView 的排布）落成 flow 子节点，由容器的 flex 列把行一行行排下去，
+  DOM 的行重建就是这样工作的；
+- 滚动容器多套一层内容层，`setContentSize:` 决定内容层高度，`overflow-y:auto` 负责滚动。
+
+交互走三个导出函数，桥在事件里调用它们：
+
+| 导出 | 谁调 | 作用 |
+| --- | --- | --- |
+| `lumen_action(i32 action, i32 row)` | 按钮 / 输入框的点击监听 | 按动作编号 switch 进对应的 state action；行号由桥从点击目标带进来 |
+| `lumen_scroll(i32 y)` | 滚动容器的 `scroll` 监听 | 把滚动距离（可夹取）写进数值单元，随后照常刷新文本与 `opacity` |
+| `dom.numberText(i64) -> i32`（import） | 数字单元刷新 | 避开 wasm 的 varargs 约定：数字转字符串交给桥做，不走 `snprintf` |
+
+```bash
+LUMEN_APP=bench ./wasm.sh          # IR -> out.wasm -> 自包含 out-wasm.html（wasm 内联 base64）
+tools/wasm/shot.sh /tmp/x.png "清空"   # 截图，并先按文字点一下按钮（交互冒烟）
+node tools/wasm/trace.mjs          # 不开浏览器：用打点桩跑一遍 wasm，看 dom.* 调用序列
+```
+
+当前状态（以 `bench` 为准，和 `cargo run -- web bench` 的静态页对照过截图）：
+
+- ✅ 静态渲染：文本、按钮、卡片、圆角/边框/背景、绝对定位底栏、200 行的列表；
+- ✅ 按钮：追加 / 清空 / 行内选中 / 行内删除，整表重建后行数、`{rows.length}` 同步更新；
+- ✅ `onScroll` + `opacity`：滚动写入数值单元，文本与绑定透明度的视图一起刷新；
+- ⚠️ 输入框只渲染外观：`onInput` / `onFocus` 还没接 DOM 的 `input` / `focus` 事件；
+- ⚠️ 条件槽位（`{flag && <Banner />}`）会编译，但槽位高度靠约束表达，DOM 上还没有做展开/收起；
+- ⚠️ `Image` 仍是占位视图；安全区由页面 CSS 自己决定。
+
+能力表里 wasm 现在是独立的一项（`src/capabilities.rs` 的 `WASM`），不再借用 web 的表。
+
 ## 平台能力表与验证
 
 平台之间不可能完全等价，所以把「不等价」写成机器可校验的东西，而不是靠记忆和肉眼看截图。
@@ -494,3 +542,9 @@ scripts/verify.sh todo       # 平台验证矩阵：构建 / 启动 / 断言逐�
 
 平台验证矩阵、哪些项只能人工、以及当前的「已知不等价」清单都在
 [docs/platform-matrix.md](docs/platform-matrix.md)。
+
+ android：LUMEN_APP=bench android/build-apk.sh && android/run-apk.sh 
+ mac：./mac.sh
+ ios: 
+ web: cargo run -- web dashboard
+

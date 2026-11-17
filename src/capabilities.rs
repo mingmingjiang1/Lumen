@@ -179,13 +179,47 @@ pub(crate) const WEB: Backend = Backend {
     ],
 };
 
+/// wasm + DOM 桥后端：IR 编成 wasm，视图调用落到 `dom.*` import 上。
+pub(crate) const WASM: Backend = Backend {
+    name: "wasm",
+    exceptions: &[
+        (
+            "onInput",
+            Support::Emulated("输入框可以渲染，onInput 还没接 DOM input 事件"),
+        ),
+        (
+            "onFocus",
+            Support::Emulated("焦点回调还没接 DOM focus 事件"),
+        ),
+        (
+            "Image",
+            Support::Emulated("只渲染占位视图，还没有接入资源加载"),
+        ),
+        (
+            "ignoresSafeArea",
+            Support::Emulated("按普通布局渲染，不模拟安全区"),
+        ),
+        (
+            "backgroundExtendsTo",
+            Support::Emulated("背景不向上延伸"),
+        ),
+        (
+            "NestedList",
+            Support::Emulated("树形行按深度缩进，子树平铺"),
+        ),
+        (
+            "RecursiveComponent",
+            Support::Emulated("可编译，子树内嵌在行模板里"),
+        ),
+    ],
+};
+
 pub(crate) fn backend_for(platform: Platform) -> &'static Backend {
     match platform {
         Platform::Ios => &IOS,
         Platform::MacOs => &MACOS,
         Platform::Android => &ANDROID,
-        // wasm 目标复用 web 的能力表：交互走 DOM 桥，暂按 web 的现状登记
-        Platform::Wasm => &WEB,
+        Platform::Wasm => &WASM,
     }
 }
 
