@@ -4069,8 +4069,8 @@ impl<'ctx> IosCodeGen<'ctx> {
     }
 
     fn scroll_class(&self) -> &'static str {
-        // macOS 首版把 ScrollView 当普通容器渲染（尚不支持滚动）
-        if self.is_mac() { "NSView" } else { "UIScrollView" }
+        // 两端都用原生滚动容器：iOS 的 UIScrollView / macOS 的 NSScrollView
+        if self.is_mac() { "NSScrollView" } else { "UIScrollView" }
     }
 
     fn input_class(&self) -> &'static str {
@@ -8842,6 +8842,44 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let frame = self.rect_constant(x, y, width, height);
                 let scroll_view = self.create_objc_instance_with_frame(self.scroll_class(), frame)?;
                 self.apply_inline_style(scroll_view, style, false)?;
+                // macOS：NSScrollView 需要 documentView，子视图挂在它上面才滚得动，
+                // 并且要打开 bounds 变化通知，滚动位置才能回传给状态单元。
+                let (scroll_host, document_height) = if self.is_mac() {
+                    let padding = node_padding(style);
+                    let layouts = layout_flex_children(
+                        children,
+                        style,
+                        width,
+                        (height - padding.vertical()).max(0.0),
+                        FlexDirection::Column,
+                        0.0,
+                    );
+                    let (_, content_height) =
+                        scroll_content_size(children, &layouts, width, height);
+                    let document_height = content_height.max(height);
+                    let content = self.create_objc_instance_with_frame(
+                        self.view_class(),
+                        self.rect_constant(0.0, 0.0, width, document_height),
+                    )?;
+                    self.send_msg_void(scroll_view, "setDocumentView:", &[content.into()])?;
+                    self.send_msg_void(
+                        scroll_view,
+                        "setHasVerticalScroller:",
+                        &[self.context.bool_type().const_int(1, false).into()],
+                    )?;
+                    let clip = self
+                        .send_msg_ptr(scroll_view, self.get_selector("contentView")?, &[])?
+                        .ok_or("NSScrollView contentView returned void")?;
+                    self.send_msg_void(
+                        clip,
+                        "setPostsBoundsChangedNotifications:",
+                        &[self.context.bool_type().const_int(1, false).into()],
+                    )?;
+                    (content, document_height)
+                } else {
+                    (scroll_view, height)
+                };
+                let _ = document_height;
                 if style.scroll_action.is_some() {
                     let target =
                         event_target.ok_or("ScrollView onScroll requires an event target")?;
@@ -8854,7 +8892,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 // 滚动容器也不再默认涂白：没写 backgroundColor 就和 UIKit 一样透明。
                 if has_direct_conditional(children) || has_direct_list(children) {
                     self.codegen_dynamic_scroll_content(
-                        scroll_view,
+                        scroll_host,
                         children,
                         style,
                         width,
@@ -8885,9 +8923,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                         Some(*layout),
                         false,
                     )?;
-                    self.send_msg_void(scroll_view, "addSubview:", &[child_view.into()])?;
+                    self.send_msg_void(scroll_host, "addSubview:", &[child_view.into()])?;
                     self.constrain_scroll_child_width(
-                        scroll_view,
+                        scroll_host,
                         child_view,
                         child,
                         *layout,
@@ -8904,7 +8942,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                     ],
                     false,
                 );
-                self.send_msg_void(scroll_view, "setContentSize:", &[content_size.into()])?;
+                self.send_msg_void(scroll_host, "setContentSize:", &[content_size.into()])?;
                 Ok(scroll_view)
             }
             IRNode::Text { content, style } => {
