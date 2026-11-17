@@ -1,0 +1,23 @@
+tools/wasm/bridge.js
+  s_cde34bea3c8a1d::t_4c0ddb1ec2f5c5 155-180
+  s_cde34bea3c8a1d::t_2d11414e02698d 254-255,257-260
+  s_cde34bea3c8a1d::t_828001b4c20ec8 292,312-314,317-319
+tools/wasm/shot.sh
+  s_cde34bea3c8a1d::t_1d17a67c3af65f 24-26,28-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.52-trip",
+  "base_commit_sha": "7116149e336ddbcc17b3f8093ecaace59b72c175",
+  "prompts": {},
+  "sessions": {
+    "s_cde34bea3c8a1d": {
+      "agent_id": {
+        "tool": "chengxiaobang",
+        "id": "s_1qkho27js745",
+        "model": "auto(free)"
+      },
+      "human_author": "jiangmingming <jiangmingming@trip.com>"
+    }
+  }
+}
