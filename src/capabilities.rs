@@ -120,15 +120,8 @@ pub(crate) const IOS: Backend = Backend {
 pub(crate) const MACOS: Backend = Backend {
     name: "macos",
     exceptions: &[
-        (
-            "ScrollView",
-            Support::Emulated("退化成普通容器，内容不滚动"),
-        ),
+        ("ScrollView", Support::Yes),
         ("onFocus", Support::Unsupported("AppKit 版还没有焦点回调")),
-        (
-            "onScroll",
-            Support::Unsupported("AppKit 版还没有滚动回调"),
-        ),
         (
             "backgroundExtendsTo",
             Support::Emulated("背景不向上延伸，按普通背景处理"),

@@ -4668,8 +4668,16 @@ impl<'ctx> IosCodeGen<'ctx> {
 
         if find_scroll_action(&program.nodes).is_some() {
             let _ = self.object_global("g_scroll_action_view");
-            let callback = self.build_scroll_delegate(program)?;
-            let selector = self.get_selector("scrollViewDidScroll:")?;
+            // iOS 走 UIScrollViewDelegate；macOS 走 NSViewBoundsDidChange 通知
+            let (callback, selector_name) = if self.is_mac() {
+                (
+                    self.build_mac_bounds_callback(program)?,
+                    "boundsDidChange:",
+                )
+            } else {
+                (self.build_scroll_delegate(program)?, "scrollViewDidScroll:")
+            };
+            let selector = self.get_selector(selector_name)?;
             let encoding = self
                 .builder
                 .build_global_string_ptr("v@:@", "scroll_fade_callback_encoding")
@@ -6189,6 +6197,110 @@ impl<'ctx> IosCodeGen<'ctx> {
         Ok(())
     }
 
+
+
+    /// macOS：NSScrollView 的滚动通过 NSViewBoundsDidChange 通知送过来，
+    /// 回调里取 clip view 的 bounds.origin.y 写进状态单元（与 iOS 的 offset 语义一致）。
+    fn build_mac_bounds_callback(
+        &self,
+        program: &UiProgram,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let callback = self.module.add_function(
+            "app_delegate_bounds_did_change",
+            self.context.void_type().fn_type(
+                &[ptr_type.into(), ptr_type.into(), ptr_type.into()],
+                false,
+            ),
+            None,
+        );
+        let entry = self.context.append_basic_block(callback, "entry");
+        let saved = self.builder.get_insert_block();
+        self.builder.position_at_end(entry);
+        let Some((cell, bounds)) = scroll_action_cell(program) else {
+            self.builder.build_return(None).map_err(|e| e.to_string())?;
+            if let Some(saved) = saved {
+                self.builder.position_at_end(saved);
+            }
+            return Ok(callback);
+        };
+        let note = callback
+            .get_nth_param(2)
+            .ok_or("bounds callback parameter is missing")?
+            .into_pointer_value();
+        let clip = self
+            .send_msg_ptr(note, self.get_selector("object")?, &[])?
+            .ok_or("NSNotification object returned void")?;
+        let rect = self
+            .send_msg_impl(
+                clip,
+                self.get_selector("bounds")?,
+                &[],
+                BasicTypeEnum::StructType(self.context.struct_type(
+                    &[
+                        self.context.f64_type().into(),
+                        self.context.f64_type().into(),
+                        self.context.f64_type().into(),
+                        self.context.f64_type().into(),
+                    ],
+                    false,
+                )),
+            )?
+            .ok_or("NSView bounds returned void")?
+            .into_struct_value();
+        let y = self
+            .builder
+            .build_extract_value(rect, 1, "bounds_y")
+            .map_err(|error| error.to_string())?
+            .into_float_value();
+        let mut value = self
+            .builder
+            .build_float_to_signed_int(y, self.context.i64_type(), "scroll_int")
+            .map_err(|error| error.to_string())?;
+        if let Some((low, high, shift)) = bounds {
+            let i64_type = self.context.i64_type();
+            if shift != 0 {
+                value = self
+                    .builder
+                    .build_int_add(value, i64_type.const_int((-shift) as u64, true), "scroll_shifted")
+                    .map_err(|error| error.to_string())?;
+            }
+            let above_low = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SGT,
+                    value,
+                    i64_type.const_int(low as u64, true),
+                    "scroll_above_low",
+                )
+                .map_err(|error| error.to_string())?;
+            let lower = self
+                .builder
+                .build_select(above_low, value, i64_type.const_int(low as u64, true), "scroll_lower")
+                .map_err(|error| error.to_string())?
+                .into_int_value();
+            let below_high = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SLT,
+                    lower,
+                    i64_type.const_int(high as u64, true),
+                    "scroll_below_high",
+                )
+                .map_err(|error| error.to_string())?;
+            value = self
+                .builder
+                .build_select(below_high, lower, i64_type.const_int(high as u64, true), "scroll_clamped")
+                .map_err(|error| error.to_string())?
+                .into_int_value();
+        }
+        self.store_cell_number(cell, value, clip)?;
+        self.builder.build_return(None).map_err(|e| e.to_string())?;
+        if let Some(saved) = saved {
+            self.builder.position_at_end(saved);
+        }
+        Ok(callback)
+    }
 
     fn build_scroll_delegate(
         &self,
@@ -8875,6 +8987,30 @@ impl<'ctx> IosCodeGen<'ctx> {
                         "setPostsBoundsChangedNotifications:",
                         &[self.context.bool_type().const_int(1, false).into()],
                     )?;
+                    if style.scroll_action.is_some() {
+                        if let Some(target) = event_target {
+                            let class = self.get_class("NSNotificationCenter")?;
+                            let centre = self
+                                .send_msg_ptr(class, self.get_selector("defaultCenter")?, &[])?
+                                .ok_or("NSNotificationCenter defaultCenter returned void")?;
+                            let name = self.module.add_global(
+                                self.context.ptr_type(AddressSpace::default()),
+                                None,
+                                "NSViewBoundsDidChangeNotification",
+                            );
+                            let selector = self.get_selector("boundsDidChange:")?;
+                            self.send_msg_void(
+                                centre,
+                                "addObserver:selector:name:object:",
+                                &[
+                                    target.into(),
+                                    selector.into(),
+                                    name.as_pointer_value().into(),
+                                    clip.into(),
+                                ],
+                            )?;
+                        }
+                    }
                     (content, document_height)
                 } else {
                     (scroll_view, height)
@@ -11412,34 +11548,29 @@ mod tests {
 
     #[test]
     fn capability_check_rejects_unsupported_features_unless_degraded() {
-        // 用 onScroll 举例：iOS / Android 支持，macOS 还没接滚动回调
+        // 用 onFocus 举例：iOS / Android 支持，macOS（AppKit）还没有焦点回调
         let program = parse_tsx_to_ast(
             r#"function App() {
-                const offset = state(0);
+                const focused = state(false);
                 return <View>
-                    <Text>{offset}</Text>
-                    <ScrollView onScroll={(y) => offset = y} style={{ height: 200 }}>
-                        <Text>content</Text>
-                    </ScrollView>
+                    <Input onFocus={() => focused = true} />
+                    <Text>{focused}</Text>
                 </View>;
             }"#,
         );
         assert!(program.errors.is_empty(), "{:?}", program.errors);
 
-        // macOS 后端还没有滚动回调：默认应该编译失败并点名 onScroll
         let error = capabilities::check(&capabilities::MACOS, &program, false)
-            .expect_err("macOS 应该拒绝 onScroll");
-        assert!(error.contains("onScroll"), "{error}");
+            .expect_err("macOS 应该拒绝 onFocus");
+        assert!(error.contains("onFocus"), "{error}");
 
-        // 加上 --allow-degrade 后降级成 warning
         let warnings =
             capabilities::check(&capabilities::MACOS, &program, true).expect("降级后应该能编译");
         assert!(
-            warnings.iter().any(|warning| warning.contains("onScroll")),
+            warnings.iter().any(|warning| warning.contains("onFocus")),
             "{warnings:?}"
         );
 
-        // iOS 支持，应当没有 warning
         let warnings = capabilities::check(&capabilities::IOS, &program, false).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
     }
