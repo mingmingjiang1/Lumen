@@ -2,6 +2,8 @@
 # 一步：IR(wasm32) -> out.wasm -> 自包含 out-wasm.html
 set -e
 APP="${LUMEN_APP:-${1:-dashboard}}"
+# 1 = 让 DOM 目标走 CSS Flexbox 排版（实验路径）；默认 0 保持编译期 frame 绝对定位
+CSS_MODE="${LUMEN_DOM_CSS:-0}"
 LLD=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/aarch64-apple-darwin/bin/rust-lld | head -1)
 CLANG="${LUMEN_CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
 
@@ -22,10 +24,11 @@ BASE64=$(base64 < out.wasm | tr -d '\n')
   echo '<title>Lumen (wasm)</title><style>'
   echo 'html,body{margin:0;height:100%;background:#fff}'
   echo 'body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",Roboto,sans-serif}'
-  echo '#root{position:relative;width:412px;height:900px;overflow:hidden}'
+  echo '#root{position:relative;width:100%;height:100%;overflow:hidden}'
   echo 'input::placeholder{color:var(--ph,rgb(120,131,155));opacity:1}'
   echo '</style></head><body>'
   echo '<div id="root"></div>'
+  echo '<script>window.__LUMEN_CSS='"$CSS_MODE"'</script>'
   echo '<script>'
   cat tools/wasm/bridge.js
   echo '</script>'

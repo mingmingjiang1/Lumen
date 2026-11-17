@@ -16,22 +16,32 @@
   const decoder = new TextDecoder();
   const root = document.getElementById('root');
 
+  // 布局模式：CSS 模式下节点是父容器的 flex 子项，位置由浏览器决定；
+  // 默认模式沿用编译期算好的 frame，桥按绝对定位落位。
+  const CSS_MODE = !!window.__LUMEN_CSS;
+
   // 类名 → 元素与基础样式。四端观感对齐的默认值都放在这里。
-  const VIEW_BASE =
-    'position:absolute;box-sizing:border-box;display:flex;flex-direction:column;align-items:flex-start;';
+  const VIEW_BASE = CSS_MODE
+    ? 'box-sizing:border-box;display:flex;flex-direction:column;align-items:stretch;'
+    : 'position:absolute;box-sizing:border-box;display:flex;flex-direction:column;' +
+      'align-items:flex-start;';
   const LABEL_BASE =
-    'position:absolute;box-sizing:border-box;display:flex;align-items:center;' +
+    (CSS_MODE ? '' : 'position:absolute;') +
+    'box-sizing:border-box;display:flex;align-items:center;' +
     'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.2;';
   const BUTTON_BASE =
-    'position:absolute;box-sizing:border-box;display:flex;align-items:center;' +
+    (CSS_MODE ? '' : 'position:absolute;') +
+    'box-sizing:border-box;display:flex;align-items:center;' +
     'justify-content:center;appearance:none;border:none;margin:0;padding:0;' +
     'background:transparent;font:inherit;cursor:pointer;';
   const INPUT_BASE =
-    'position:absolute;box-sizing:border-box;border:none;outline:none;' +
+    (CSS_MODE ? '' : 'position:absolute;') +
+    'box-sizing:border-box;border:none;outline:none;' +
     'font:inherit;line-height:1.2;background:transparent;';
-  const SCROLL_BASE =
-    'position:absolute;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;' +
-    'display:block;';
+  const SCROLL_BASE = CSS_MODE
+    ? 'box-sizing:border-box;overflow-y:auto;overflow-x:hidden;' +
+      'display:flex;flex-direction:column;'
+    : 'position:absolute;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;display:block;';
 
   const NAMED_COLORS = {
     black: '#000000',
@@ -103,6 +113,7 @@
     const [tag, base] = spec;
     const el = document.createElement(tag);
     el.setAttribute('style', base);
+    el.__base = base;
     if (tag === 'input') el.type = 'text';
     if (tag === 'button') el.type = 'button';
     return el;
@@ -125,10 +136,13 @@
     const { className, x, y, width, height } = entry;
     const el = makeElement(className);
     if (!el) return put({ kind: 'unknown', className });
-    el.style.left = `${x}px`;
-    el.style.top = `${y}px`;
-    el.style.width = `${width}px`;
-    el.style.height = `${height}px`;
+    // CSS 模式不落像素位置：位置和尺寸由随后发来的样式决定；默认模式仍按 frame 落位。
+    if (!CSS_MODE) {
+      el.style.left = `${x}px`;
+      el.style.top = `${y}px`;
+      el.style.width = `${width}px`;
+      el.style.height = `${height}px`;
+    }
     return put({ kind: 'view', className, el });
   }
 
@@ -163,6 +177,7 @@
   };
 
   function applyAnchorConstraint(anchorHandle, otherHandle, constant) {
+    if (CSS_MODE) return;
     const child = get(anchorHandle);
     const other = get(otherHandle);
     if (!child || child.kind !== 'anchor' || !other || other.kind !== 'anchor') return;
@@ -177,6 +192,9 @@
     if (box.left !== undefined && box.right !== undefined) el.style.width = 'auto';
     if (box.top !== undefined && box.bottom !== undefined) el.style.height = 'auto';
   }
+
+  // 滚动容器内层：承载 padding 与 gap，自身不再设固定高度
+  const CONTENT_BASE = 'box-sizing:border-box;';
 
   const dom = {
     // ---- 类与实例 ----
@@ -374,6 +392,24 @@
       const el = element(viewHandle);
       if (el) el.dataset.rowTag = String(tag);
     },
+    // ---- 样式 ----
+    // 编译期算好的 CSS 直接落到元素上。追加而不覆盖：盒模型先来，容器/滚动这类
+    // 后续声明要能盖住前面的同名属性。
+    style(viewHandle, ptr) {
+      if (!CSS_MODE) return;
+      const el = element(viewHandle);
+      if (!el) return;
+      const css = readCstring(Number(ptr));
+      el.__css = el.__css ? `${el.__css}${css}` : css;
+      el.style.cssText = (el.__base || '') + el.__css;
+    },
+    contentStyle(viewHandle, ptr) {
+      if (!CSS_MODE) return;
+      const el = element(viewHandle);
+      if (!el) return;
+      const content = ensureContent(el);
+      content.style.cssText = CONTENT_BASE + readCstring(Number(ptr));
+    },
     // ---- 文本与样式 ----
     setText(viewHandle, textHandle) {
       const el = element(viewHandle);
@@ -457,18 +493,25 @@
       const el = element(viewHandle);
       if (!el) return;
       const content = ensureContent(el);
-      content.style.height = `${height}px`;
+      // CSS 模式只给下限：内容由 flex 子项撑开；默认模式沿用编译期内容高度
+      if (CSS_MODE) content.style.minHeight = `${height}px`;
+      else content.style.height = `${height}px`;
     },
     // ---- 容器排布 ----
+    // CSS 模式下这些属性已经在样式串里了；再按控件消息写一遍会把真实方向盖掉
+    // （动态子节点会把行容器当竖栈配置，直接把 row 改成 column）。
     stackAxis(viewHandle, axis) {
+      if (CSS_MODE) return;
       const el = element(viewHandle);
       if (el) el.style.flexDirection = axis === 0 ? 'row' : 'column';
     },
     stackSpacing(viewHandle, spacing) {
+      if (CSS_MODE) return;
       const el = element(viewHandle);
       if (el) el.style.gap = `${spacing}px`;
     },
     stackDistribution(viewHandle, distribution) {
+      if (CSS_MODE) return;
       const el = element(viewHandle);
       if (!el) return;
       const keywords = [
@@ -481,6 +524,7 @@
       el.style.justifyContent = keywords[distribution] || 'flex-start';
     },
     layoutMargins(viewHandle, top, left, bottom, right) {
+      if (CSS_MODE) return;
       const el = element(viewHandle);
       if (el) el.style.padding = `${top}px ${right}px ${bottom}px ${left}px`;
     },

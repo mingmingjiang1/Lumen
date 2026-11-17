@@ -1,5 +1,6 @@
 mod android;
 mod capabilities;
+mod css;
 mod source_backend;
 mod view_backend;
 
@@ -582,6 +583,12 @@ fn node_uses_intrinsic_dimension(node: &IRNode, vertical: bool) -> bool {
             node_uses_intrinsic_dimension(active, vertical)
         }
     }
+}
+
+/// DOM 目标的 CSS 排版模式（`LUMEN_DOM_CSS=1` 打开）。
+/// 关掉时 wasm 输出和以前一样：编译期 frame + 绝对定位。
+fn dom_css_mode() -> bool {
+    matches!(std::env::var("LUMEN_DOM_CSS").as_deref(), Ok("1"))
 }
 
 fn node_style(node: &IRNode) -> &InlineStyle {
@@ -3922,6 +3929,8 @@ struct IosCodeGen<'ctx> {
     /// 绑定了透明度的视图（按单元分组）：`style={{ opacity: fade }}`
     opacity_globals: RefCell<HashMap<String, Vec<GlobalValue<'ctx>>>>,
     opacity_counter: Cell<usize>,
+    /// DOM 目标每段 CSS 都要有自己的全局字符串名
+    css_counter: Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -4037,6 +4046,7 @@ impl<'ctx> IosCodeGen<'ctx> {
             expr_counter: Cell::new(0),
             opacity_globals: RefCell::new(HashMap::new()),
             opacity_counter: Cell::new(0),
+            css_counter: Cell::new(0),
         }
     }
 
@@ -8056,6 +8066,11 @@ impl<'ctx> IosCodeGen<'ctx> {
         height: f64,
         safe_area_box: bool,
     ) -> Result<(), String> {
+        // CSS 模式的 DOM 目标由浏览器排版：再补一套按编译期 frame 算的约束只会和
+        // Flexbox 打架（锚点常量会变成相对流位置的偏移，直接导致节点重叠）。
+        if self.view_kind == view_backend::Kind::Dom && dom_css_mode() {
+            return Ok(());
+        }
         let direction = style.flex_direction.unwrap_or(default_direction);
         let vertical_flow = direction == FlexDirection::Column;
         let padding = node_padding(style);
@@ -9146,6 +9161,13 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let dynamic_layout = has_direct_conditional(children);
                 let view = self.create_objc_instance_with_frame(self.view_class(), view_frame)?;
                 self.apply_inline_style(view, style, false)?;
+                let view_css = css::container_css(
+                    style,
+                    FlexDirection::Column,
+                    0.0,
+                    css::has_absolute_child(children),
+                );
+                self.apply_dom_css("style", view, view_css, "view")?;
                 // 只有根视图需要一个不透明底色（窗口背景是黑的）；其他容器没写 backgroundColor
                 // 时保持透明，否则嵌在有背景色的卡片里会画出一块白。
                 if is_root && style.background_color.is_none() {
@@ -9217,6 +9239,13 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let dynamic_layout = has_direct_conditional(children);
                 let stack = self.create_objc_instance_with_frame(self.view_class(), frame)?;
                 self.apply_inline_style(stack, style, false)?;
+                let stack_css = css::container_css(
+                    style,
+                    FlexDirection::Column,
+                    style.spacing.unwrap_or(8.0),
+                    css::has_absolute_child(children),
+                );
+                self.apply_dom_css("style", stack, stack_css, "stack")?;
                 let padding = node_padding(style);
                 let safe_area_box = is_root || style.ignores_safe_area_top;
                 if dynamic_layout {
@@ -9294,6 +9323,14 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let frame = self.rect_constant(x, y, width, height);
                 let scroll_view = self.create_objc_instance_with_frame(self.scroll_class(), frame)?;
                 self.apply_inline_style(scroll_view, style, false)?;
+                self.apply_dom_css("style", scroll_view, css::scroll_css(style), "scroll")?;
+                // 内层内容层承载 padding 与 gap，和静态 HTML 后端的结构一致
+                self.apply_dom_css(
+                    "contentStyle",
+                    scroll_view,
+                    css::scroll_content_css(style, style.spacing.unwrap_or(0.0)),
+                    "scroll_content",
+                )?;
                 if style.scroll_action.is_some() {
                     if self.view_kind == view_backend::Kind::Dom {
                         self.view()
@@ -9897,6 +9934,31 @@ impl<'ctx> IosCodeGen<'ctx> {
         self.send_msg_void(field, selector, &[attributed.into()])
     }
 
+    /// DOM 目标：把一段 CSS 交给桥，由浏览器排版。
+    ///
+    /// 这是 wasm 侧的「布局权威」边界：样式串给出去之后，编译期算的 frame 不再参与
+    /// 常规节点的位置与尺寸；只有桥没收到样式的节点（overlay 的 `setFrame:`、条件槽位
+    /// 的高度约束）才继续用像素。
+    fn apply_dom_css(
+        &self,
+        op: &'static str,
+        view: PointerValue<'ctx>,
+        css: String,
+        hint: &str,
+    ) -> Result<(), String> {
+        if self.view_kind != view_backend::Kind::Dom || !dom_css_mode() || css.is_empty() {
+            return Ok(());
+        }
+        let index = self.css_counter.get();
+        self.css_counter.set(index + 1);
+        let text = self
+            .builder
+            .build_global_string_ptr(&css, &format!("g_css_{hint}_{index}"))
+            .map_err(|error| error.to_string())?;
+        self.view()
+            .dom_statement(op, &[view.into(), text.as_pointer_value().into()])
+    }
+
     fn apply_inline_style(
         &self,
         view: PointerValue<'ctx>,
@@ -9904,6 +9966,15 @@ impl<'ctx> IosCodeGen<'ctx> {
         text_like: bool,
     ) -> Result<(), String> {
         self.apply_box_style(view, style)?;
+        // 非文本节点按容器发：方向/对齐/间距必须和盒模型一起到，否则动态插槽
+        // 这类只走 apply_inline_style 的节点会退回基线样式（竖栈）。
+        let dom_css = if text_like {
+            css::text_css(style)
+        } else {
+            let direction = style.flex_direction.unwrap_or(FlexDirection::Column);
+            css::container_css(style, direction, style.spacing.unwrap_or(0.0), false)
+        };
+        self.apply_dom_css("style", view, dom_css, "box")?;
         if text_like {
             self.apply_text_style(view, style)?;
         }
