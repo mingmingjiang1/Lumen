@@ -4098,6 +4098,14 @@ impl<'ctx> IosCodeGen<'ctx> {
         if self.platform.is_android() {
             return self.generate_android(program);
         }
+        // wasm 目标：IR/链接链路已通，但视图层还没从 objc_msgSend 换成 DOM 桥。
+        // 这里显式挡住，避免产出一个「能链成 .wasm 但什么都不会画」的假成功。
+        if self.platform == Platform::Wasm {
+            return Err(
+                "wasm 后端还没接 DOM 桥：视图调用仍是 objc_msgSend。\n                 已完成：Platform::Wasm / wasm32 三元组 / rust-lld 链接 / tools/wasm/bridge.js / wasm.sh。\n                 待完成：把 send_msg_void/send_msg_ptr 在 Platform::Wasm 下分派到 dom.* import。"
+                    .into(),
+            );
+        }
         *self.state_cells.borrow_mut() = state_cells(&program.states);
         if program.states.is_empty() && program.nodes.iter().any(node_has_input_binding) {
             return Err("Input onInput requires a state(...) declaration".into());
