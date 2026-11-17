@@ -1,0 +1,47 @@
+tools/parity.py
+  s_8dcfec8c986992::t_da17f595368acf 1-154
+src/README.md
+  s_63663f071acdca::t_cc3b827488ed97 233,315
+  s_63663f071acdca::t_14378a0776af88 294,296-297
+docs/platform-matrix.md
+  s_63663f071acdca::t_b461f12253d4d6 54-56
+mac.sh
+  s_63663f071acdca::t_d35fff603d06b2 5
+README.md
+  s_63663f071acdca::t_f3d1587de1ca2b 396,398-399,403
+  s_63663f071acdca::t_3e1df2fc4f556e 323,326,420-423,438-439,461
+.gitignore
+  s_63663f071acdca::t_04759b3745678c 13-17
+tools/image.py
+  s_8dcfec8c986992::t_e27c8f681187e7 1-186
+src/main.rs
+  s_63663f071acdca::t_5c0e12fcf121e2 9031,9062,9064,9081
+  s_63663f071acdca::t_facb10f86b0548 11952-11962
+  s_63663f071acdca::t_3d9214a7602520 6265-6266,8423-8472
+src/capabilities.rs
+  s_63663f071acdca::t_7bfa20d6a945f2 123-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.52-trip",
+  "base_commit_sha": "5a5e97b5c12f01f69b1f0dfe1ce432f48698a7f9",
+  "prompts": {},
+  "sessions": {
+    "s_63663f071acdca": {
+      "agent_id": {
+        "tool": "chengxiaobang",
+        "id": "s_ejsdoyokiv6w",
+        "model": "auto(free)"
+      },
+      "human_author": "jiangmingming <jiangmingming@trip.com>"
+    },
+    "s_8dcfec8c986992": {
+      "agent_id": {
+        "tool": "chengxiaobang",
+        "id": "s_k8qib1etsbmu",
+        "model": "auto(free)"
+      },
+      "human_author": "jiangmingming <jiangmingming@trip.com>"
+    }
+  }
+}
