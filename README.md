@@ -320,9 +320,10 @@ cargo run -- macos       # 生成 AppKit IR
 | 按钮 | `UIButton`（titleColor / contentEdgeInsets） | `NSButton`（contentTintColor，无边框 + layer 背景） |
 | 背景 / 圆角 | `setBackgroundColor:` + layer | `wantsLayer` + layer |
 | 事件 | `addTarget:action:forControlEvents:` | `setTarget:` / `setAction:` |
+| 滚动 | `UIScrollView` + `UIScrollViewDelegate` 的 `scrollViewDidScroll:` | `NSScrollView` + `isFlipped` 文档视图，位置靠 `NSViewBoundsDidChange` 通知回传 |
 | 安全区 | `safeAreaLayoutGuide`（状态栏 / home indicator） | 同名 API，窗口内容区通常没有额外 inset |
 
-macOS 首版尚未支持：`ScrollView` 退化成普通容器（内容不滚动）、`onInput`/`onFocus` 事件、滚动渐显，以及含条件子级的容器里文本的横向对齐（`NSStackView` 对齐映射还不准）。
+macOS 首版尚未支持：`onFocus` 事件，以及含条件子级的容器里文本的横向对齐（`NSStackView` 对齐映射还不准）。
 
 `Input` 在 macOS 上用 `NSTextField` 渲染（占位符走 `setPlaceholderString:`），并且已经接上了
 `onInput`：构建期把输入框设为 AppDelegate 的 delegate，回调用 `controlTextDidChange:` 按身份
@@ -392,26 +393,14 @@ Android 首版尚未对齐的地方（有意记录，后续再补）：
 
 
 
-给顶部栏设置 `id`，并在对应的 `ScrollView` 上设置 `fadeTarget`。顶部栏整体（背景和子元素）初始透明；滚动超过 `fadeStart` 后，在 `fadeDistance` 点内渐显至完全可见。
+### 已移除：`fadeTarget` / `fadeStart` / `fadeDistance`
 
-```tsx
-<View style={{ id: "topBar", backgroundColor: "rgb(28, 39, 61)" }}>
-    <Text>My Dashboard</Text>
-</View>
-<ScrollView style={{
-    fadeTarget: "topBar",
-    fadeStart: 0,
-    fadeDistance: 120
-}}>
-    {/* scrollable content */}
-</ScrollView>
-```
-
-每个界面首版支持一个渐变目标；目标必须是带背景色的 `View`/`VStack`，`fadeDistance` 必须大于零。
+这三个内建样式键已经删掉，写了会直接编译报错（报错信息给出迁移写法）。滚动渐显现在是
+`onScroll` 写滚动位置 + `opacity` 绑这个数值单元，两件普通能力组合出来，iOS / macOS / Android 一致。
 
 ### 滚动事件（`onScroll`）
 
-`fadeTarget` 是编译器内建的一个效果，长期应该由用户态实现。第一步是先把**滚动位置**暴露出来：
+滚动位置是一条普通能力：`onScroll={(y) => ...}` 把当前滚动距离写进数值单元：
 
 ```tsx
 function App() {
@@ -428,10 +417,10 @@ function App() {
 - 目标必须是一个数值单元（`state(0)`），其它形态直接编译报错，不会静默不生效；
 - 写入前可以夹取：`onScroll={(y) => offset = clamp(y, 0, 100)}`（`clamp` 只接受整数字面量边界，
   且要求 `low < high`）；
-- iOS/macOS 走生成的 `scrollViewDidScroll:`（滚动位置取 `contentOffset.y + adjustedContentInset.top`），
-  Android 走 `nativeOnScroll(scrollY)`；写入后只刷新引用这个单元的文本，不重建视图树；
-- 每个 App 目前支持一个滚动绑定；macOS 的 AppKit 后端还没接滚动回调（能力表登记为不支持），
-  web 静态页登记为「不带滚动交互」；
+- 滚动位置：iOS 走生成的 `scrollViewDidScroll:`（取 `contentOffset.y + adjustedContentInset.top`），
+  macOS 走 `NSViewBoundsDidChange` 通知（clip view 的 `bounds.origin.y`，文档视图是 `isFlipped` 的，
+  向下滚动时就是正数，不需要取反），Android 走 `nativeOnScroll(scrollY)`；写入后只刷新引用这个单元的文本，不重建视图树；
+- 每个 App 目前支持一个滚动绑定；web 静态页登记为「不带滚动交互」；
 - `app/Bench.tsx` 拿它显示当前滚动位置，滚动时数字会实时变化。
 
 有了这个能力，「滚动渐显」就能逐步从 `fadeTarget` 改写成 TSX：`onScroll` 写位置 → 透明度绑样式。
@@ -446,8 +435,8 @@ const offset = state(0);
 ```
 
 - 值可以是数值单元（0..100，换算成 `alpha = v / 100` 并夹到 0..1），也可以是常量（`opacity: 50` = 50%）；
-- iOS/macOS 在 `update_cell_labels` 里顺带 `setAlpha:`，Android 在各单元的 `lumen_refresh_N` 里顺带 `setAlpha`，
-  所以和文本刷新是同一条路径——滚动时只更新这一个视图，不重建视图树；
+- iOS/macOS 在 `update_cell_labels` 里顺带 `setAlpha:`（AppKit 是 `setAlphaValue:`），Android 在各单元的
+  `lumen_refresh_N` 里顺带 `setAlpha`，所以和文本刷新是同一条路径——滚动时只更新这一个视图，不重建视图树；
 - 写死的透明度（`opacity: 0`）也走同一套，三端一致；
 - web 是静态页，只渲染**初始值**（没有运行时更新）；
 - 顺手修掉一个 Android 侧的真坑：绑定的视图句柄必须存 **global ref**，存 local ref 的话
@@ -469,7 +458,7 @@ const offset = state(0);
 | `Unsupported` | 没实现 | **编译失败**并点名是哪个能力；加 `--allow-degrade` 才降级成 warning |
 
 ```bash
-cargo run -- macos todo                    # macOS 还没有滚动渐显 → 直接报错
+cargo run -- macos todo                    # macOS 的 onFocus 仍不支持 → 直接报错
 cargo run -- macos todo --allow-degrade    # 降级成 warning 后编译（mac.sh 就是这么跑的）
 ```
 

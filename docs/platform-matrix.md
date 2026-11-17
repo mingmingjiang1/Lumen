@@ -51,8 +51,9 @@ LUMEN_APP=todo ./mac.sh      # 启动后人工点击「完成 / 展开 / 输入�
 
 | 能力 | iOS | macOS | Android | Web |
 | --- | --- | --- | --- | --- |
-| `fadeTarget`（滚动渐显） | ✅ | ❌ 未实现 | ✅ | ⚠️ 静态页不做 |
-| `ScrollView` | ✅ | ⚠️ 内容不滚动 | ✅ | ✅ |
+| `onScroll`（滚动事件） | ✅ `scrollViewDidScroll:` | ✅ `NSViewBoundsDidChange` 通知 | ✅ `nativeOnScroll` | ⚠️ 静态页不做 |
+| `opacity`（绑定数值单元） | ✅ `setAlpha:` | ✅ `setAlphaValue:` | ✅ `setAlpha` | ⚠️ 只渲染初始值 |
+| `ScrollView` | ✅ | ✅ | ✅ | ✅ |
 | `onFocus` | ✅ | ❌ 未实现 | ✅ | ⚠️ 无交互 |
 | `Image` | ✅ | ✅ | ⚠️ 只占位 | ⚠️ 只占位 |
 | `ignoresSafeArea` / `backgroundExtendsTo` | ✅ | ⚠️ 按普通背景 | ⚠️ 宿主补状态栏内边距 | ⚠️ 忽略 |

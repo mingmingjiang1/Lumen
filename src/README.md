@@ -230,7 +230,7 @@ cargo run -- macos       # 生成 AppKit IR
 | 事件 | `addTarget:action:forControlEvents:` | `setTarget:` / `setAction:` |
 | 安全区 | `safeAreaLayoutGuide`（状态栏 / home indicator） | 同名 API，窗口内容区通常没有额外 inset |
 
-macOS 首版尚未支持：`ScrollView` 退化成普通容器（内容不滚动）、`onInput`/`onFocus` 事件、滚动渐显，以及含条件子级的容器里文本的横向对齐（`NSStackView` 对齐映射还不准）。
+macOS 首版尚未支持：`onFocus` 事件，以及含条件子级的容器里文本的横向对齐（`NSStackView` 对齐映射还不准）。`ScrollView` 已经是 `NSScrollView` + `isFlipped` 文档视图，`onScroll` 靠 `NSViewBoundsDidChange` 通知回传位置。
 
 `Input` 在 macOS 上用 `NSTextField` 渲染（占位符走 `setPlaceholderString:`），并且已经接上了
 `onInput`：构建期把输入框设为 AppDelegate 的 delegate，回调用 `controlTextDidChange:` 按身份
@@ -291,22 +291,10 @@ Android 首版尚未对齐的地方（有意记录，后续再补）：
 
 
 
-给顶部栏设置 `id`，并在对应的 `ScrollView` 上设置 `fadeTarget`。顶部栏整体（背景和子元素）初始透明；滚动超过 `fadeStart` 后，在 `fadeDistance` 点内渐显至完全可见。
+### 已移除：`fadeTarget` / `fadeStart` / `fadeDistance`
 
-```tsx
-<View style={{ id: "topBar", backgroundColor: "rgb(28, 39, 61)" }}>
-    <Text>My Dashboard</Text>
-</View>
-<ScrollView style={{
-    fadeTarget: "topBar",
-    fadeStart: 0,
-    fadeDistance: 120
-}}>
-    {/* scrollable content */}
-</ScrollView>
-```
-
-每个界面首版支持一个渐变目标；目标必须是带背景色的 `View`/`VStack`，`fadeDistance` 必须大于零。
+这三个内建样式键已删掉，写了会直接编译报错。滚动渐显现在由 `onScroll` + `opacity` 组合出来，
+具体写法见根目录 README 的「滚动事件」与「样式绑定」两节。
 
 ## 平台能力表与验证
 
@@ -324,7 +312,7 @@ Android 首版尚未对齐的地方（有意记录，后续再补）：
 | `Unsupported` | 没实现 | **编译失败**并点名是哪个能力；加 `--allow-degrade` 才降级成 warning |
 
 ```bash
-cargo run -- macos todo                    # macOS 还没有滚动渐显 → 直接报错
+cargo run -- macos todo                    # macOS 的 onFocus 仍不支持 → 直接报错
 cargo run -- macos todo --allow-degrade    # 降级成 warning 后编译（mac.sh 就是这么跑的）
 ```
 

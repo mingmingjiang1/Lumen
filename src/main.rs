@@ -3875,6 +3875,8 @@ enum Platform {
     Ios,
     MacOs,
     Android,
+    /// web 目标：LLVM IR 编到 wasm32，视图层交给 DOM 桥（import "dom"）
+    Wasm,
 }
 
 impl Platform {
@@ -3999,12 +4001,11 @@ impl<'ctx> IosCodeGen<'ctx> {
         let builder = context.create_builder();
 
         // 设置目标三元组：arm64-apple-ios
-        module.set_triple(&TargetTriple::create(if platform.is_mac() {
-            "arm64-apple-macosx14.0.0"
-        } else if platform.is_android() {
-            "aarch64-linux-android26"
-        } else {
-            "arm64-apple-ios"
+        module.set_triple(&TargetTriple::create(match platform {
+            Platform::MacOs => "arm64-apple-macosx14.0.0",
+            Platform::Android => "aarch64-linux-android26",
+            Platform::Wasm => "wasm32-unknown-unknown",
+            Platform::Ios => "arm64-apple-ios",
         }));
 
         let ptr_type = context.ptr_type(AddressSpace::default());
@@ -4247,7 +4248,15 @@ impl<'ctx> IosCodeGen<'ctx> {
 
         self.module.verify().map_err(|e| e.to_string())?;
         self.module.print_to_file("out.ll").map_err(|e| e.to_string())?;
-        println!("LLVM IR 已写入 out.ll (target: arm64-apple-ios)");
+        println!(
+            "LLVM IR 已写入 out.ll (target: {})",
+            match self.platform {
+                Platform::MacOs => "arm64-apple-macos",
+                Platform::Android => "aarch64-linux-android26",
+                Platform::Wasm => "wasm32-unknown-unknown",
+                Platform::Ios => "arm64-apple-ios",
+            }
+        );
         Ok(())
     }
 
@@ -6253,11 +6262,8 @@ impl<'ctx> IosCodeGen<'ctx> {
             .build_extract_value(rect, 1, "bounds_y")
             .map_err(|error| error.to_string())?
             .into_float_value();
-        // 生成的 documentView 是非翻转坐标：往下滚 bounds.origin.y 是负数，取反才是「已滚动距离」
-        let y = self
-            .builder
-            .build_float_neg(y, "bounds_scrolled")
-            .map_err(|error| error.to_string())?;
+        // documentView 是 isFlipped 的 LumenFlippedView，clip 的 bounds.y 向下递增，
+        // 所以滚动距离就是 bounds.origin.y，不需要取反。
         let mut value = self
             .builder
             .build_float_to_signed_int(y, self.context.i64_type(), "scroll_int")
@@ -8414,6 +8420,57 @@ impl<'ctx> IosCodeGen<'ctx> {
         self.add_anchor_constraint(document, "trailingAnchor", clip_view, "trailingAnchor", 0.0)?;
         self.add_anchor_constraint(document, "topAnchor", clip_view, "topAnchor", 0.0)?;
 
+        // 滚动位置靠 clip view 的 bounds 通知回传：AppKit 没有 UIScrollViewDelegate 那样的
+        // 滚动回调，要自己打开通知并向 NSNotificationCenter 注册观察者（object 收窄到这个 clip）。
+        if style.scroll_action.is_some() {
+            let ptr_type = self.context.ptr_type(AddressSpace::default());
+            let target = event_target.ok_or("ScrollView onScroll requires an event target")?;
+            self.send_msg_void(
+                clip_view,
+                "setPostsBoundsChangedNotifications:",
+                &[self.context.bool_type().const_int(1, false).into()],
+            )?;
+            // `NSViewBoundsDidChangeNotification` 是 AppKit 导出的 `NSString *` 全局符号，
+            // 这里要的是它的值；把符号地址当对象传进去只会拿到一个指向指针的地址。
+            let notification_global = match self.module.get_global("NSViewBoundsDidChangeNotification") {
+                Some(global) => global,
+                None => self
+                    .module
+                    .add_global(self.context.ptr_type(AddressSpace::default()), None, "NSViewBoundsDidChangeNotification"),
+            };
+            let notification = self
+                .builder
+                .build_load(
+                    ptr_type,
+                    notification_global.as_pointer_value(),
+                    "bounds_notification_name",
+                )
+                .map_err(|error| error.to_string())?
+                .into_pointer_value();
+            let centre = self
+                .send_msg_ptr(
+                    self.get_class("NSNotificationCenter")?,
+                    self.get_selector("defaultCenter")?,
+                    &[],
+                )?
+                .ok_or("NSNotificationCenter defaultCenter returned void")?;
+            let selector = self.get_selector("boundsDidChange:")?;
+            self.send_msg_void(
+                centre,
+                "addObserver:selector:name:object:",
+                &[
+                    target.into(),
+                    selector.into(),
+                    notification.into(),
+                    clip_view.into(),
+                ],
+            )?;
+            let global = self.object_global("g_scroll_action_view");
+            self.builder
+                .build_store(global.as_pointer_value(), scroll_view)
+                .map_err(|error| error.to_string())?;
+        }
+
         let padding = node_padding(style);
         let layouts = layout_flex_children(
             children,
@@ -8959,68 +9016,6 @@ impl<'ctx> IosCodeGen<'ctx> {
                 let frame = self.rect_constant(x, y, width, height);
                 let scroll_view = self.create_objc_instance_with_frame(self.scroll_class(), frame)?;
                 self.apply_inline_style(scroll_view, style, false)?;
-                // macOS：NSScrollView 需要 documentView，子视图挂在它上面才滚得动，
-                // 并且要打开 bounds 变化通知，滚动位置才能回传给状态单元。
-                let (scroll_host, document_height) = if self.is_mac() {
-                    let padding = node_padding(style);
-                    let layouts = layout_flex_children(
-                        children,
-                        style,
-                        width,
-                        (height - padding.vertical()).max(0.0),
-                        FlexDirection::Column,
-                        0.0,
-                    );
-                    let (_, content_height) =
-                        scroll_content_size(children, &layouts, width, height);
-                    let document_height = content_height.max(height);
-                    let content = self.create_objc_instance_with_frame(
-                        self.view_class(),
-                        self.rect_constant(0.0, 0.0, width, document_height),
-                    )?;
-                    self.send_msg_void(scroll_view, "setDocumentView:", &[content.into()])?;
-                    self.send_msg_void(
-                        scroll_view,
-                        "setHasVerticalScroller:",
-                        &[self.context.bool_type().const_int(1, false).into()],
-                    )?;
-                    let clip = self
-                        .send_msg_ptr(scroll_view, self.get_selector("contentView")?, &[])?
-                        .ok_or("NSScrollView contentView returned void")?;
-                    self.send_msg_void(
-                        clip,
-                        "setPostsBoundsChangedNotifications:",
-                        &[self.context.bool_type().const_int(1, false).into()],
-                    )?;
-                    if style.scroll_action.is_some() {
-                        if let Some(target) = event_target {
-                            let class = self.get_class("NSNotificationCenter")?;
-                            let centre = self
-                                .send_msg_ptr(class, self.get_selector("defaultCenter")?, &[])?
-                                .ok_or("NSNotificationCenter defaultCenter returned void")?;
-                            let name = self.module.add_global(
-                                self.context.ptr_type(AddressSpace::default()),
-                                None,
-                                "NSViewBoundsDidChangeNotification",
-                            );
-                            let selector = self.get_selector("boundsDidChange:")?;
-                            self.send_msg_void(
-                                centre,
-                                "addObserver:selector:name:object:",
-                                &[
-                                    target.into(),
-                                    selector.into(),
-                                    name.as_pointer_value().into(),
-                                    clip.into(),
-                                ],
-                            )?;
-                        }
-                    }
-                    (content, document_height)
-                } else {
-                    (scroll_view, height)
-                };
-                let _ = document_height;
                 if style.scroll_action.is_some() {
                     let target =
                         event_target.ok_or("ScrollView onScroll requires an event target")?;
@@ -9033,7 +9028,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                 // 滚动容器也不再默认涂白：没写 backgroundColor 就和 UIKit 一样透明。
                 if has_direct_conditional(children) || has_direct_list(children) {
                     self.codegen_dynamic_scroll_content(
-                        scroll_host,
+                        scroll_view,
                         children,
                         style,
                         width,
@@ -9064,9 +9059,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                         Some(*layout),
                         false,
                     )?;
-                    self.send_msg_void(scroll_host, "addSubview:", &[child_view.into()])?;
+                    self.send_msg_void(scroll_view, "addSubview:", &[child_view.into()])?;
                     self.constrain_scroll_child_width(
-                        scroll_host,
+                        scroll_view,
                         child_view,
                         child,
                         *layout,
@@ -9083,7 +9078,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                     ],
                     false,
                 );
-                self.send_msg_void(scroll_host, "setContentSize:", &[content_size.into()])?;
+                self.send_msg_void(scroll_view, "setContentSize:", &[content_size.into()])?;
                 Ok(scroll_view)
             }
             IRNode::Text { content, style } => {
@@ -10204,6 +10199,11 @@ fn main() {
         .any(|arg| matches!(arg.as_str(), "android" | "--target=android"))
     {
         Platform::Android
+    } else if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "wasm" | "--target=wasm"))
+    {
+        Platform::Wasm
     } else {
         Platform::Ios
     };
@@ -11948,6 +11948,17 @@ mod tests {
         let ir = ios.module.print_to_string().to_string();
         assert!(ir.contains("scroll_action_write"), "{ir}");
         assert!(ir.contains("scrollViewDidScroll:"), "{ir}");
+
+        // macOS：向 NSNotificationCenter 注册 clip view 的 bounds 通知，回调里写单元
+        let context = Context::create();
+        let mut mac = IosCodeGen::new_for(&context, Platform::MacOs);
+        mac.generate(&program).unwrap();
+        let ir = mac.module.print_to_string().to_string();
+        assert!(ir.contains("setPostsBoundsChangedNotifications:"), "{ir}");
+        assert!(ir.contains("addObserver:selector:name:object:"), "{ir}");
+        assert!(ir.contains("NSViewBoundsDidChangeNotification"), "{ir}");
+        assert!(ir.contains("boundsDidChange:"), "{ir}");
+        assert!(ir.contains("app_delegate_bounds_did_change"), "{ir}");
 
         // Android：nativeOnScroll 里写单元并刷新
         let context = Context::create();

@@ -120,11 +120,8 @@ pub(crate) const IOS: Backend = Backend {
 pub(crate) const MACOS: Backend = Backend {
     name: "macos",
     exceptions: &[
-        ("ScrollView", Support::Yes),
-        (
-            "onScroll",
-            Support::Unsupported("AppKit 的 bounds 通知还没接进回调"),
-        ),
+        // ScrollView / onScroll 都已经实现：滚动位置走 NSViewBoundsDidChange 通知
+        // （见 codegen_mac_scroll），所以不登记例外。
         ("onFocus", Support::Unsupported("AppKit 版还没有焦点回调")),
         (
             "backgroundExtendsTo",
@@ -187,6 +184,8 @@ pub(crate) fn backend_for(platform: Platform) -> &'static Backend {
         Platform::Ios => &IOS,
         Platform::MacOs => &MACOS,
         Platform::Android => &ANDROID,
+        // wasm 目标复用 web 的能力表：交互走 DOM 桥，暂按 web 的现状登记
+        Platform::Wasm => &WEB,
     }
 }
 
