@@ -121,6 +121,10 @@ pub(crate) const MACOS: Backend = Backend {
     name: "macos",
     exceptions: &[
         ("ScrollView", Support::Yes),
+        (
+            "onScroll",
+            Support::Unsupported("AppKit 的 bounds 通知还没接进回调"),
+        ),
         ("onFocus", Support::Unsupported("AppKit 版还没有焦点回调")),
         (
             "backgroundExtendsTo",
