@@ -21,9 +21,18 @@ function clickText(text) {
   const el = [...document.querySelectorAll('button')].find(
     (b) => b.textContent.trim() === text
   );
-  if (el) el.click();
+  if (!el) return false;
+  el.click();
+  return true;
 }
-clicks.forEach((text, index) => setTimeout(() => clickText(text), 60 * (index + 1)));
+// wasm 里的界面是异步建出来的：按钮还没出现就点会静默失败，所以按 60ms 轮询
+// 直到点中再推进下一个，避免把「还没建好」误判成「点了没反应」。
+let index = 0;
+(function step() {
+  if (index >= clicks.length) return;
+  if (clickText(clicks[index])) index += 1;
+  setTimeout(step, 60);
+})();
 </script>
 """ % json.dumps(clicks, ensure_ascii=False)
 open(out, 'w', encoding='utf-8').write(html.replace('</body>', script + '</body>'))

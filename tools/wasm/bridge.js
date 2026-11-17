@@ -152,6 +152,32 @@
     else if (anchor.edge === 'width') el.style.width = `${constraint.value}px`;
   }
 
+  // 「贴住父视图某条边」是 Auto Layout 里唯一有 CSS 等价物的约束：leading/top 落到
+  // left/top，trailing/bottom 落到 right/bottom。两条边都贴住时把尺寸放开成 auto，
+  // 和约束里两条边同时生效的结果一致。其余约束（跨层级、和兄弟对齐）继续只记录。
+  const ANCHOR_SIDES = {
+    leading: 'left',
+    trailing: 'right',
+    top: 'top',
+    bottom: 'bottom',
+  };
+
+  function applyAnchorConstraint(anchorHandle, otherHandle, constant) {
+    const child = get(anchorHandle);
+    const other = get(otherHandle);
+    if (!child || child.kind !== 'anchor' || !other || other.kind !== 'anchor') return;
+    const el = element(child.view);
+    const host = element(other.view);
+    if (!el || !host || el.parentElement !== host) return;
+    const side = ANCHOR_SIDES[child.edge];
+    if (!side) return;
+    el.style[side] = `${constant}px`;
+    const box = el.__anchorBox || (el.__anchorBox = {});
+    box[side] = constant;
+    if (box.left !== undefined && box.right !== undefined) el.style.width = 'auto';
+    if (box.top !== undefined && box.bottom !== undefined) el.style.height = 'auto';
+  }
+
   const dom = {
     // ---- 类与实例 ----
     class(ptr) {
@@ -225,7 +251,13 @@
     numberValue(handle) {
       return numberHandle(handle);
     },
+    // 布尔状态单元在 wasm 里是 NSString（"true"/"false"），取值语义跟
+    // NSString boolValue 一致：按前缀认 Y/y/T/t/1-9，其余算 false。
     boolValue(handle) {
+      const entry = get(handle);
+      if (entry && entry.kind === 'string') {
+        return /^[ \t\n]*[yYtT1-9]/.test(entry.text) ? 1 : 0;
+      }
       const el = element(handle);
       return el ? 1 : 0;
     },
@@ -257,7 +289,7 @@
     cgColor(colorHandle) {
       return colorHandle;
     },
-    // ---- Auto Layout：只记录，不参与布局 ----
+    // ---- Auto Layout：只有「贴父视图」的边约束参与布局，其余只记录 ----
     anchor(viewHandle, namePtr) {
       const edge = readCstring(namePtr).replace(/Anchor$/, '').toLowerCase();
       return put({ kind: 'anchor', view: viewHandle, edge });
@@ -277,10 +309,14 @@
       applyConstraintValue(constraint);
     },
     constraintAnchor(anchorHandle, otherHandle) {
-      return put({ kind: 'constraint', anchor: anchorHandle, other: otherHandle });
+      const handle = put({ kind: 'constraint', anchor: anchorHandle, other: otherHandle, constant: 0 });
+      applyAnchorConstraint(anchorHandle, otherHandle, 0);
+      return handle;
     },
     constraintAnchorConst(anchorHandle, otherHandle, constant) {
-      return put({ kind: 'constraint', anchor: anchorHandle, other: otherHandle, constant });
+      const handle = put({ kind: 'constraint', anchor: anchorHandle, other: otherHandle, constant });
+      applyAnchorConstraint(anchorHandle, otherHandle, constant);
+      return handle;
     },
     constraintAnchorMul(anchorHandle, otherHandle, multiplier) {
       return put({ kind: 'constraint', anchor: anchorHandle, other: otherHandle, multiplier });
