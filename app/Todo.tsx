@@ -39,7 +39,6 @@ function App() {
         </View>
 
         <ScrollView style={{
-            fadeTarget: "topBar", fadeStart: 0, fadeDistance: 120,
             marginHorizontal: 16, marginTop: 10, marginBottom: 72,
             flexGrow: 1, padding: 16, spacing: 14,
             backgroundColor: "white", borderRadius: 18,

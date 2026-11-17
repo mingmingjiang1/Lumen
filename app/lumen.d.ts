@@ -108,5 +108,16 @@ declare function state(initial: number): number;
 declare function state(initial: string): string;
 /** 对象状态会被展开成多个独立单元：读写 `profile.visits` 只更新引用该字段的视图。 */
 declare function state<T extends Record<string, number | string | boolean>>(initial: T): T;
+/**
+ * 数组状态：行的字段集由初始值的第一行决定（不能用空数组）。
+ * 行由 `items.map((item, index) => ...)` 渲染。
+ */
+declare function state<T extends Record<string, number | string | boolean>>(initial: T[]): LumenList<T>;
+
+interface LumenList<T> extends Array<T> {
+  /** 删除当前行（只能写在 `items.map((item, index) => ...)` 的模板里）。 */
+  removeAt(index: number): void;
+}
+
 declare function onMount(effect: () => void): void;
 declare function onUnmount(effect: () => void): void;

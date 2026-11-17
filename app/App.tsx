@@ -22,6 +22,8 @@ function App() {
     let showInsight = state(false);
     // 复杂状态：对象会被展开成多个独立单元，name 和 visits 各自更新。
     const profile = state({ name: "guest", visits: 0 });
+    // 滚动进度：以前是内建的 fadeTarget，现在用 onScroll + clamp + opacity 自己写
+    const progress = state(0);
     return <View style={{
             width: "100%", height: "100%",
             backgroundColor: "rgb(242, 245, 250)",
@@ -30,6 +32,7 @@ function App() {
             <View style={{
                 id: "topBar",
                 ignoresSafeArea: "top",
+                opacity: progress,
                 width: "100%", height: 44, padding: 12,
                 flexDirection: "row", alignItems: "center", justifyContent: "space-between",
                 backgroundColor: "rgb(28, 39, 61)"
@@ -37,8 +40,7 @@ function App() {
                 <Text style={{ fontSize: 22, color: "white", textAlign: "center" }}>My Dashboard</Text>
                 <Text style={{ fontSize: 14, color: "rgb(190, 205, 230)", textAlign: "center" }}>TODAY</Text>
             </View>
-            <ScrollView style={{
-                fadeTarget: "topBar", fadeStart: 0, fadeDistance: 120,
+            <ScrollView onScroll={(y) => progress = clamp(y, 0, 100)} style={{
                 marginHorizontal: 16, flexGrow: 1, marginTop: 10,
                 marginBottom: 80,
                 padding: 16, spacing: 14, backgroundColor: "white", borderRadius: 18
