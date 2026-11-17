@@ -1,0 +1,34 @@
+src/main.rs
+  s_cde34bea3c8a1d::t_c2490246a66f31 4049
+  s_cde34bea3c8a1d::t_eacaac127f085c 8072-8073
+  s_cde34bea3c8a1d::t_79a48f03a77daf 9937-9941,9950-9958,9960-9961,9969-9973,9976
+  s_cde34bea3c8a1d::t_50c2954bb2be2d 9942-9948,9959
+  s_cde34bea3c8a1d::t_2242e370f98f22 9164-9169
+  s_cde34bea3c8a1d::t_6666fd00483318 9242-9247
+  s_cde34bea3c8a1d::t_55940f3d281334 3932-3933
+  s_cde34bea3c8a1d::t_10b78ccf605a92 9326-9333
+tools/wasm/bridge.js
+  s_cde34bea3c8a1d::t_529bb3aec6187f 196-198
+  s_cde34bea3c8a1d::t_640b516a5a50f9 395-412
+  s_cde34bea3c8a1d::t_3e279cc3d51331 30,33-34,38-39
+  s_cde34bea3c8a1d::t_de23788bacc5d0 116
+src/css.rs
+  s_cde34bea3c8a1d::t_bc98ebd313cb47 187-198
+  s_cde34bea3c8a1d::t_51a62468b635c5 1-186,199-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.52-trip",
+  "base_commit_sha": "c93f76453fb4fe784e312f7cd18eaccd52238315",
+  "prompts": {},
+  "sessions": {
+    "s_cde34bea3c8a1d": {
+      "agent_id": {
+        "tool": "chengxiaobang",
+        "id": "s_1qkho27js745",
+        "model": "auto(free)"
+      },
+      "human_author": "jiangmingming <jiangmingming@trip.com>"
+    }
+  }
+}
