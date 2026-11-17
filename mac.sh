@@ -2,8 +2,8 @@
 set -e
 
 # ---------- 生成 AppKit IR ----------
-echo "==> [1/3] cargo run -- macos ${LUMEN_APP:-dashboard}"
-cargo run -- --target=macos "${LUMEN_APP:-dashboard}"
+echo "==> [1/3] cargo run -- macos ${LUMEN_APP:-dashboard}（--allow-degrade：macOS 后端还没有滚动渐显）"
+cargo run -- --target=macos "${LUMEN_APP:-dashboard}" --allow-degrade
 
 # LLVM 23 会把部分 double 常量打印成 f0x 前缀，Xcode 的 clang 不认，链接前归一化
 sed -i '' 's/f0x/0x/g' out.ll

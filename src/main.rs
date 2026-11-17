@@ -6542,7 +6542,7 @@ impl<'ctx> IosCodeGen<'ctx> {
                     )
                     .map_err(|error| error.to_string())?
                     .into_pointer_value();
-                self.send_msg_void(view, "setAlpha:", &[alpha.into()])?;
+                self.send_view_alpha(view, alpha)?;
             }
         }
         Ok(())
@@ -9468,17 +9468,9 @@ impl<'ctx> IosCodeGen<'ctx> {
                 })
                 .unwrap_or(1.0)
                 .clamp(0.0, 1.0);
-            self.send_msg_void(
-                view,
-                "setAlpha:",
-                &[self.context.f64_type().const_float(initial).into()],
-            )?;
+            self.send_view_alpha(view, self.context.f64_type().const_float(initial))?;
         } else if let Some(alpha) = style.opacity_static {
-            self.send_msg_void(
-                view,
-                "setAlpha:",
-                &[self.context.f64_type().const_float(alpha).into()],
-            )?;
+            self.send_view_alpha(view, self.context.f64_type().const_float(alpha))?;
         }
         if let Some(cell) = &style.opacity_cell {
             let index = self.opacity_counter.get();
@@ -9502,6 +9494,16 @@ impl<'ctx> IosCodeGen<'ctx> {
     }
 
     /// 设置背景色：UIKit 直接用 setBackgroundColor:，AppKit 要走 layer。
+    /// 设置视图透明度：UIKit 用 setAlpha:，AppKit 用 setAlphaValue:。
+    fn send_view_alpha(
+        &self,
+        view: PointerValue<'ctx>,
+        alpha: inkwell::values::FloatValue<'ctx>,
+    ) -> Result<(), String> {
+        let selector = if self.is_mac() { "setAlphaValue:" } else { "setAlpha:" };
+        self.send_msg_void(view, selector, &[alpha.into()])
+    }
+
     fn apply_background_color(
         &self,
         view: PointerValue<'ctx>,

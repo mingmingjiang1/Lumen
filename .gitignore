@@ -2,8 +2,9 @@
 /target/
 **/*.rs.bk
 
-# LLVM 生成物
+# 编译产物
 out.ll
+out.html
 *.o
 Demo
 
